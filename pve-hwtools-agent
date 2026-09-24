@@ -1,0 +1,180 @@
+#!/bin/bash
+# pve-hwtools-agent —— PVE 工具集状态代理
+#
+# 唯一的配置真相：/etc/default/pve-hwtools
+# 职责：读/写该配置；施加 CPU 调频；按配置触发界面重渲染。
+#
+# 由 PVE 面板「PVE 工具集」页经节点级 API（/nodes/{node}/hwtools）调用；也可手工执行：
+#   pve-hwtools-agent status
+#   pve-hwtools-agent set show_fan=0 governor=performance freq_max=3800000
+#   pve-hwtools-agent apply          # 按配置重新施加调频并重渲染（开机自启用）
+set -u
+
+CONF=/etc/default/pve-hwtools
+RENDER=/usr/local/bin/pve-hwpatch.sh
+CP=/sys/devices/system/cpu/cpu0/cpufreq
+
+die() { echo "错误：$*" >&2; exit 1; }
+need_root() { [ "$(id -u)" = 0 ] || die "需要 root 权限"; }
+
+# ---------- 缺省值 ----------
+defaults() {
+  SHOW_CPU_TEMP=1
+  SHOW_FAN=1
+  SHOW_DISK=1
+  SHOW_CPU_FREQ=1
+  BLOCK_SUBSCRIPTION_PROMPT=1
+  CPU_GOVERNOR=conservative
+  CPU_FREQ_MIN=800000
+  CPU_FREQ_MAX=3800000
+}
+load_conf() {
+  defaults
+  [ -f "$CONF" ] && . "$CONF"
+  return 0
+}
+
+# ---------- 硬件事实（一律现读，不缓存）----------
+hw_min() { cat "$CP/cpuinfo_min_freq" 2>/dev/null || echo 800000; }
+hw_max() { cat "$CP/cpuinfo_max_freq" 2>/dev/null || echo 4300000; }
+live_gov() { cat "$CP/scaling_governor" 2>/dev/null || echo unknown; }
+live_min() { cat "$CP/scaling_min_freq" 2>/dev/null || echo 0; }
+live_max() { cat "$CP/scaling_max_freq" 2>/dev/null || echo 0; }
+
+# 可用调速器：用户列的五种优先，再补内核上报的其它（去掉 userspace）
+gov_list() {
+  local all out="" g
+  all=$(cat "$CP/scaling_available_governors" 2>/dev/null)
+  for g in performance powersave ondemand conservative schedutil; do
+    case " $all " in *" $g "*) out="$out$g," ;; esac
+  done
+  for g in $all; do
+    case "$g" in
+      userspace|performance|powersave|ondemand|conservative|schedutil) ;;
+      *) out="$out$g," ;;
+    esac
+  done
+  printf '%s' "${out%,}"
+}
+
+# ---------- 校验 ----------
+valid_gov() {
+  local v="$1" g
+  for g in $(gov_list | tr ',' ' '); do
+    [ "$g" = "$v" ] && { printf '%s' "$v"; return 0; }
+  done
+  die "不支持的调频模式「$v」。可用：$(gov_list | tr ',' ' ')"
+}
+valid_freq() {
+  local v="$1" hmin hmax
+  case "$v" in ''|*[!0-9]*) die "频率必须是纯数字（单位 kHz）：$v" ;; esac
+  hmin=$(hw_min); hmax=$(hw_max)
+  [ "$v" -lt "$hmin" ] && die "频率 $v kHz 低于硬件下限 $hmin kHz"
+  [ "$v" -gt "$hmax" ] && die "频率 $v kHz 高于硬件上限 $hmax kHz"
+  printf '%s' "$v"
+}
+valid_01() {
+  case "$1" in 0|1) printf '%s' "$1" ;; *) die "开关只能是 0 或 1：$1" ;; esac
+}
+
+# ---------- 写配置 ----------
+write_conf() {
+  cat > "$CONF" <<EOF
+# PVE 工具集配置 —— 由面板「PVE 工具集」页生成，也可手工编辑
+# 改后执行： /usr/local/bin/pve-hwtools-agent apply
+#
+# 概要显示开关（1 开 / 0 关）
+SHOW_CPU_TEMP=$SHOW_CPU_TEMP
+SHOW_FAN=$SHOW_FAN
+SHOW_DISK=$SHOW_DISK
+SHOW_CPU_FREQ=$SHOW_CPU_FREQ
+#
+# 屏蔽「无有效订阅」弹窗
+BLOCK_SUBSCRIPTION_PROMPT=$BLOCK_SUBSCRIPTION_PROMPT
+#
+# CPU 调频（频率单位 kHz；范围须落在硬件能力内）
+CPU_GOVERNOR=$CPU_GOVERNOR
+CPU_FREQ_MIN=$CPU_FREQ_MIN
+CPU_FREQ_MAX=$CPU_FREQ_MAX
+EOF
+  chmod 644 "$CONF"
+}
+
+# ---------- 施加 CPU 调频 ----------
+apply_freq() {
+  local out
+  out=$(cpupower frequency-set -g "$CPU_GOVERNOR" -d "$CPU_FREQ_MIN" -u "$CPU_FREQ_MAX" 2>&1) \
+    || die "设置 CPU 调频失败：$out"
+  # 复核：内核会把越界值钳到硬件范围，读回确认真实生效值
+  [ "$(live_gov)" = "$CPU_GOVERNOR" ] \
+    || die "调频模式未生效：期望 $CPU_GOVERNOR，实际 $(live_gov)"
+  return 0
+}
+try_apply_freq() {
+  command -v cpupower >/dev/null 2>&1 || return 0
+  apply_freq
+}
+
+# ---------- 状态（JSON）----------
+emit_status() {
+  load_conf
+  local jg="" g
+  for g in $(gov_list | tr ',' ' '); do jg="$jg\"$g\","; done
+  jg="${jg%,}"
+  cat <<EOF
+{"show_cpu_temp":$SHOW_CPU_TEMP,"show_fan":$SHOW_FAN,"show_disk":$SHOW_DISK,"show_cpu_freq":$SHOW_CPU_FREQ,"block_subscription":$BLOCK_SUBSCRIPTION_PROMPT,"governor":"$CPU_GOVERNOR","freq_min":$CPU_FREQ_MIN,"freq_max":$CPU_FREQ_MAX,"governor_live":"$(live_gov)","freq_min_live":$(live_min),"freq_max_live":$(live_max),"freq_hw_min":$(hw_min),"freq_hw_max":$(hw_max),"config_file":"$CONF","governors":[$jg]}
+EOF
+}
+
+# ---------- 命令 ----------
+cmd_status() { emit_status; }
+
+cmd_set() {
+  need_root
+  load_conf
+  [ $# -gt 0 ] || die "set 需要至少一个 k=v 参数"
+
+  local gov="$CPU_GOVERNOR" fmin="$CPU_FREQ_MIN" fmax="$CPU_FREQ_MAX"
+  local freq_changed=0 kv k v
+
+  # 先全部校验，通过后才落盘与生效
+  for kv in "$@"; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    case "$k" in
+      show_cpu_temp) SHOW_CPU_TEMP=$(valid_01 "$v") ;;
+      show_fan) SHOW_FAN=$(valid_01 "$v") ;;
+      show_disk) SHOW_DISK=$(valid_01 "$v") ;;
+      show_cpu_freq) SHOW_CPU_FREQ=$(valid_01 "$v") ;;
+      block_subscription) BLOCK_SUBSCRIPTION_PROMPT=$(valid_01 "$v") ;;
+      governor) gov=$(valid_gov "$v"); freq_changed=1 ;;
+      freq_min) fmin=$(valid_freq "$v"); freq_changed=1 ;;
+      freq_max) fmax=$(valid_freq "$v"); freq_changed=1 ;;
+      *) die "未知配置项：$k" ;;
+    esac
+  done
+  [ "$fmin" -le "$fmax" ] || die "频率下限（$fmin kHz）不能高于上限（$fmax kHz）"
+
+  CPU_GOVERNOR="$gov"; CPU_FREQ_MIN="$fmin"; CPU_FREQ_MAX="$fmax"
+
+  # 先生效；失败则不落盘（保证配置与系统状态一致）
+  if [ "$freq_changed" = 1 ]; then apply_freq; fi
+
+  write_conf
+  if [ -x "$RENDER" ]; then "$RENDER" >/dev/null 2>&1; fi
+  emit_status
+}
+
+cmd_apply() {
+  need_root
+  load_conf
+  try_apply_freq
+  if [ -x "$RENDER" ]; then "$RENDER" >/dev/null 2>&1; fi
+  emit_status
+}
+
+case "${1:-status}" in
+  status) cmd_status ;;
+  set) shift; cmd_set "$@" ;;
+  apply) cmd_apply ;;
+  *) die "用法：pve-hwtools-agent {status|set k=v...|apply}" ;;
+esac
