@@ -1,5 +1,7 @@
 # Proxmox VE 面板补丁集
 
+> **当前版本：V1.0** · 发布于 2026-09-24
+
 自用的 PVE Web 界面增强补丁，纯 shell，无第三方依赖（除系统已有的 python3 / lm-sensors）。
 
 ## 包含
