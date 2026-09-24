@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V2.0
+# 版本：V2.1
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -9,6 +9,7 @@
 #
 # 唯一的配置真相： /etc/default/pve-hwtools
 # 权限代理：       /usr/local/bin/pve-hwtools-agent
+# CPU 世代映射：   /usr/local/lib/pve-hwtools/cpu-model.sh（s.sh 与 agent 共用）
 #
 # 注入点（各有 BEGIN/END 标记，重复执行只替换不叠加）：
 #   /usr/share/perl5/PVE/API2/Nodes.pm            —— PVE_HWPATCH（tdata）+ PVE_HWAPI（hwtools）
@@ -32,6 +33,8 @@ AGENT=/usr/local/bin/pve-hwtools-agent
 J=/usr/share/pve-manager/js/pvemanagerlib.js
 N=/usr/share/perl5/PVE/API2/Nodes.pm
 SH=/usr/bin/s.sh
+CPUDBDIR=/usr/local/lib/pve-hwtools
+CPUDB="$CPUDBDIR/cpu-model.sh"
 BK=/root/pve-upgrade-backup
 mkdir -p "$BK"
 changed=0
@@ -52,10 +55,14 @@ SHOW_CPU_FREQ=1
 # 屏蔽「无有效订阅」弹窗
 BLOCK_SUBSCRIPTION_PROMPT=1
 #
-# CPU 调频（频率单位 kHz；范围须落在硬件能力内）
+# CPU 调频（频率单位 **MHz**；范围须落在硬件能力内）
 CPU_GOVERNOR=conservative
-CPU_FREQ_MIN=800000
-CPU_FREQ_MAX=3800000
+CPU_FREQ_MIN=800
+CPU_FREQ_MAX=3800
+# Turbo 加速（1 启用 / 0 关闭；本机不支持时忽略）
+CPU_TURBO=1
+# 能效偏好 EPP（仅部分新平台支持）
+CPU_EPP=balance_performance
 EOC
   chmod 644 "$CONF"; changed=1; echo "  [0] 已建 $CONF"
 else
@@ -71,11 +78,188 @@ else
   echo "  [0b] 警告：$NOSUB 不存在，订阅提示屏蔽未处理" >&2
 fi
 
+# ---------- 0.5) CPU 世代映射（s.sh 与 agent 共用一份，避免两处走偏）----------
+mkdir -p "$CPUDBDIR"
+if [ ! -f "$CPUDB" ] || ! grep -q "^# cpu-model.sh v1" "$CPUDB" 2>/dev/null; then
+  [ ! -f "$CPUDB.orig" ] && [ -f "$CPUDB" ] && cp -a "$CPUDB" "$CPUDB.orig"
+  cat > "$CPUDB" <<'EOCPU'
+#!/bin/bash
+# cpu-model.sh v1 —— CPUID 家族/型号 → 微架构代号 的映射（共享片段）
+#
+# 数据来源（权威）：
+#   Intel：Linux 内核 arch/x86/include/asm/intel-family.h 的 INTEL_FAM6_* 型号表
+#   AMD  ：Linux 内核 arch/x86/kernel/cpu/amd.c 的 Zen 世代判定 + 内核文档（k10temp 等）
+# 覆盖 2000 年至今主流 Intel/AMD 桌面与移动处理器；未收录者回退为「family/model」。
+#
+# 用法： . /usr/local/lib/pve-hwtools/cpu-model.sh ; cpu_gen
+# 依赖： /proc/cpuinfo
+
+cpu_vendor() { grep -m1 '^vendor_id' /proc/cpuinfo 2>/dev/null | awk '{print $3}'; }
+cpu_fam()    { grep -m1 '^cpu family' /proc/cpuinfo 2>/dev/null | awk '{print $4}'; }
+cpu_mod()    { grep -m1 '^model' /proc/cpuinfo 2>/dev/null | head -1 | sed 's/^model[[:space:]]*:[[:space:]]*//'; }
+cpu_brand()  { grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | sed 's/^model name[[:space:]]*:[[:space:]]*//'; }
+
+intel_gen() {
+  local m=$1
+  case "$m" in
+        1) printf '%s' "Pentium Pro" ;;
+        3) printf '%s' "Pentium II (Klamath)" ;;
+        5) printf '%s' "Pentium III (Deschutes)" ;;
+        11) printf '%s' "Pentium III (Tualatin)" ;;
+        13) printf '%s' "Pentium M (Dothan)" ;;
+        14) printf '%s' "Core (Yonah)" ;;
+        15) printf '%s' "Core 2 (Merom/Conroe)" ;;
+        22) printf '%s' "Core 2 Mobile (Merom)" ;;
+        23) printf '%s' "Core 2 (Penryn/Wolfdale)" ;;
+        26) printf '%s' "Nehalem-EP (Gainestown)" ;;
+        28) printf '%s' "Atom (Bonnell)" ;;
+        29) printf '%s' "Core 2 Extreme (Dunnington)" ;;
+        30) printf '%s' "Nehalem (1st Gen Core)" ;;
+        31) printf '%s' "Nehalem (Auburndale/Havendale)" ;;
+        37) printf '%s' "Westmere (1st Gen Core)" ;;
+        38) printf '%s' "Atom (Bonnell MID)" ;;
+        39) printf '%s' "Atom (Saltwell MID)" ;;
+        42) printf '%s' "Sandy Bridge (2nd Gen Core)" ;;
+        44) printf '%s' "Westmere-EP (Gulftown)" ;;
+        45) printf '%s' "Sandy Bridge-E" ;;
+        46) printf '%s' "Nehalem-EX (Beckton)" ;;
+        47) printf '%s' "Westmere-EX (Westmere-EX)" ;;
+        53) printf '%s' "Atom (Saltwell Tablet)" ;;
+        54) printf '%s' "Atom (Saltwell)" ;;
+        55) printf '%s' "Atom (Silvermont)" ;;
+        58) printf '%s' "Ivy Bridge (3rd Gen Core)" ;;
+        60) printf '%s' "Haswell (4th Gen Core)" ;;
+        61) printf '%s' "Broadwell (5th Gen Core)" ;;
+        62) printf '%s' "Ivy Bridge-E" ;;
+        63) printf '%s' "Haswell-E" ;;
+        69) printf '%s' "Haswell Mobile" ;;
+        70) printf '%s' "Haswell (Crystal Well)" ;;
+        71) printf '%s' "Broadwell (Crystal Well)" ;;
+        74) printf '%s' "Atom (Silvermont MID)" ;;
+        76) printf '%s' "Atom (Airmont)" ;;
+        77) printf '%s' "Atom (Silvermont-D)" ;;
+        78) printf '%s' "Skylake Mobile (6th Gen Core)" ;;
+        79) printf '%s' "Broadwell-E" ;;
+        85) printf '%s' "Skylake-X (Xeon)" ;;
+        86) printf '%s' "Broadwell-DE (Xeon D)" ;;
+        87) printf '%s' "Xeon Phi Knl" ;;
+        90) printf '%s' "Atom (Silvermont MID2)" ;;
+        92) printf '%s' "Atom (Goldmont)" ;;
+        94) printf '%s' "Skylake (6th Gen Core)" ;;
+        95) printf '%s' "Atom (Goldmont-D)" ;;
+        102) printf '%s' "Cannon Lake (8th Gen Core)" ;;
+        106) printf '%s' "Ice Lake-X (Xeon)" ;;
+        108) printf '%s' "Ice Lake-D (Xeon D)" ;;
+        117) printf '%s' "Atom (Airmont NP)" ;;
+        122) printf '%s' "Atom (Goldmont Plus)" ;;
+        125) printf '%s' "Ice Lake (10th Gen Core)" ;;
+        126) printf '%s' "Ice Lake Mobile (10th Gen Core)" ;;
+        133) printf '%s' "Xeon Phi Knm" ;;
+        134) printf '%s' "Atom (Tremont-D)" ;;
+        138) printf '%s' "Lakefield" ;;
+        140) printf '%s' "Tiger Lake Mobile (11th Gen Core)" ;;
+        141) printf '%s' "Tiger Lake (11th Gen Core)" ;;
+        142) printf '%s' "Kaby Lake Mobile (7th Gen Core)" ;;
+        143) printf '%s' "Sapphire Rapids (Xeon)" ;;
+        150) printf '%s' "Atom (Tremont)" ;;
+        151) printf '%s' "Alder Lake (12th Gen Core)" ;;
+        154) printf '%s' "Alder Lake Mobile (12th Gen Core)" ;;
+        156) printf '%s' "Atom (Tremont-L)" ;;
+        157) printf '%s' "Ice Lake NNPI" ;;
+        158) printf '%s' "Kaby Lake (7th Gen Core)" ;;
+        165) printf '%s' "Comet Lake (10th Gen Core)" ;;
+        166) printf '%s' "Comet Lake Mobile (10th Gen Core)" ;;
+        167) printf '%s' "Rocket Lake (11th Gen Core)" ;;
+        170) printf '%s' "Meteor Lake Mobile (Core Ultra 1)" ;;
+        172) printf '%s' "Meteor Lake (Core Ultra 1)" ;;
+        173) printf '%s' "Granite Rapids (Xeon)" ;;
+        174) printf '%s' "Granite Rapids-D (Xeon)" ;;
+        175) printf '%s' "Atom (Crestmont-X)" ;;
+        181) printf '%s' "Arrow Lake-U (Core Ultra 2)" ;;
+        182) printf '%s' "Atom (Crestmont)" ;;
+        183) printf '%s' "Raptor Lake (13th Gen Core)" ;;
+        186) printf '%s' "Raptor Lake-P Mobile" ;;
+        189) printf '%s' "Lunar Lake (Core Ultra 2)" ;;
+        190) printf '%s' "Atom (Gracemont)" ;;
+        191) printf '%s' "Raptor Lake-S (14th Gen Core)" ;;
+        197) printf '%s' "Arrow Lake-H (Core Ultra 2)" ;;
+        198) printf '%s' "Arrow Lake-S (Core Ultra 2)" ;;
+        204) printf '%s' "Panther Lake (Core Ultra 3)" ;;
+        207) printf '%s' "Emerald Rapids (Xeon)" ;;
+        213) printf '%s' "Wildcatlake L" ;;
+        215) printf '%s' "Bartlett Lake" ;;
+        221) printf '%s' "Atom (Darkmont-X)" ;;
+        229) printf '%s' "Panther Lake-R" ;;
+    *) printf 'Intel family 6 model %s（未收录）' "$m" ;;
+  esac
+}
+
+amd_gen() {
+  local f=$1 m=$2
+  case "$f" in
+    23)
+      if [ "$m" -ge 0 ] && [ "$m" -le 47 ]; then printf '%s' "Zen / Zen+"; return 0; fi
+      if [ "$m" -ge 48 ] && [ "$m" -le 79 ]; then printf '%s' "Zen 2"; return 0; fi
+      if [ "$m" -ge 80 ] && [ "$m" -le 95 ]; then printf '%s' "Zen / Zen+"; return 0; fi
+      if [ "$m" -ge 96 ] && [ "$m" -le 127 ]; then printf '%s' "Zen 2"; return 0; fi
+      if [ "$m" -ge 144 ] && [ "$m" -le 145 ]; then printf '%s' "Zen 2"; return 0; fi
+      if [ "$m" -ge 160 ] && [ "$m" -le 175 ]; then printf '%s' "Zen 2"; return 0; fi
+      ;;
+    25)
+      if [ "$m" -ge 0 ] && [ "$m" -le 15 ]; then printf '%s' "Zen 3"; return 0; fi
+      if [ "$m" -ge 16 ] && [ "$m" -le 31 ]; then printf '%s' "Zen 4"; return 0; fi
+      if [ "$m" -ge 32 ] && [ "$m" -le 95 ]; then printf '%s' "Zen 3 / Zen 3+"; return 0; fi
+      if [ "$m" -ge 96 ] && [ "$m" -le 175 ]; then printf '%s' "Zen 4 / Zen 4c"; return 0; fi
+      ;;
+  esac
+  case "$f" in
+      5) printf '%s' "K6 (K6/K6-2/K6-III)" ;;
+      6) printf '%s' "K7 (Athlon/Athlon XP/Duron/Sempron)" ;;
+      15) printf '%s' "K8 (Athlon 64/64 X2/Opteron/Turion 64)" ;;
+      16) printf '%s' "K10 (Phenom/Phenom II/Athlon II/Opteron)" ;;
+      17) printf '%s' "K8 移动版 (Turion X2 Ultra/Griffin)" ;;
+      18) printf '%s' "Llano (12h APU)" ;;
+      20) printf '%s' "Bobcat (Brazos: E/C/G/Z 系列)" ;;
+      21) printf '%s' "Bulldozer/Piledriver/Steamroller/Excavator (FX/A 系列)" ;;
+      22) printf '%s' "Jaguar/Puma (Kabini/Mullins)" ;;
+      23) printf '%s' "Zen / Zen+ / Zen 2" ;;
+      24) printf '%s' "Hygon Dhyana" ;;
+      25) printf '%s' "Zen 3 / Zen 3+ / Zen 4" ;;
+      26) printf '%s' "Zen 5 / Zen 5c" ;;
+    *) printf 'AMD family %s model %s（未收录）' "$f" "$m" ;;
+  esac
+}
+
+cpu_gen() {
+  local v f m
+  v=$(cpu_vendor); f=$(cpu_fam); m=$(cpu_mod)
+  case "$v" in
+    GenuineIntel)
+      case "$f" in
+        5)  printf 'Intel Pentium (P5 世代)' ;;
+        6)  intel_gen "$m" ;;
+        15) printf 'Intel NetBurst (Pentium 4 / Pentium D)' ;;
+        11) printf 'Intel Knights (Xeon Phi)' ;;
+        19) printf 'Intel Xeon 6 (Diamond Rapids)' ;;
+        *)  printf 'Intel family %s model %s' "$f" "$m" ;;
+      esac ;;
+    AuthenticAMD) amd_gen "$f" "$m" ;;
+    HygonGenuine) printf 'Hygon Dhyana (AMD Zen 衍生)' ;;
+    *) printf '%s family %s model %s' "${v:-未知}" "$f" "$m" ;;
+  esac
+}
+EOCPU
+  chmod 644 "$CPUDB"
+  changed=1; echo "  [0.5] 已写 $CPUDB（CPU 世代映射）"
+else
+  echo "  [0.5] $CPUDB 已是最新，跳过"
+fi
+
 # ---------- 1) 传感器取样脚本（纯 ASCII 数值与名称）----------
-if [ ! -f "$SH" ] || ! grep -q "$MARK-v7" "$SH" 2>/dev/null; then
+if [ ! -f "$SH" ] || ! grep -q "$MARK-v8" "$SH" 2>/dev/null; then
   cat > "$SH" <<'EOS'
 #!/bin/bash
-# PVE_HWPATCH-v7 —— 输出节点硬件概要 JSON（单行，纯 ASCII 数值与名称，单位由前端补）
+# PVE_HWPATCH-v8 —— 输出节点硬件概要 JSON（单行，纯 ASCII 数值与名称，单位由前端补）
 je(){ printf '%s' "$1" | LC_ALL=C sed 's/\\/\\\\/g; s/"/\\"/g; s/[^ -~]//g'; }
 command -v sensors >/dev/null 2>&1 || { echo '{}'; exit 0; }
 S=$(sensors 2>/dev/null)
@@ -135,13 +319,19 @@ if [ -n "$MINK" ]; then MIN=$(awk "BEGIN{printf \"%d\", $MINK/1000}"); else
   MIN=$(lscpu 2>/dev/null | awk -F: '/min MHz/{gsub(/ /,"",$2); printf "%d", $2}' | head -1)
 fi
 
-printf '{"cpu_pkg":"%s","cpu_cores":"%s","disks":"%s","board":"%s","fans":"%s","cpu_cur":"%s","cpu_min":"%s","cpu_max":"%s"}\n' \
+# CPU 代号与基准频率（映射见共享文件 cpu-model.sh，与设置页同一份数据）
+CPUGEN="-"; BASEF=0
+[ -r /usr/local/lib/pve-hwtools/cpu-model.sh ] && { . /usr/local/lib/pve-hwtools/cpu-model.sh; CPUGEN=$(cpu_gen); }
+b=$(cat /sys/devices/system/cpu/cpu0/cpufreq/base_frequency 2>/dev/null)
+[ -n "$b" ] && BASEF=$(awk "BEGIN{printf \"%d\", $b/1000}")
+
+printf '{"cpu_pkg":"%s","cpu_cores":"%s","disks":"%s","board":"%s","fans":"%s","cpu_cur":"%s","cpu_min":"%s","cpu_max":"%s","cpu_gen":"%s","cpu_base":"%s"}\n' \
   "$(je "${CPU_PKG:--}")" "$(je "${CORES:--}")" "$(je "$DISKS")" "$(je "${BOARD:--}")" \
-  "$(je "${FANS:--}")" "${CUR:-0}" "${MIN:-0}" "${MAX:-0}"
+  "$(je "${FANS:--}")" "${CUR:-0}" "${MIN:-0}" "${MAX:-0}" "$(je "$CPUGEN")" "${BASEF:-0}"
 EOS
-  chmod +x "$SH"; changed=1; echo "  [1] 已写 $SH（v7）"
+  chmod +x "$SH"; changed=1; echo "  [1] 已写 $SH（v8）"
 else
-  echo "  [1] $SH 已是 v7，跳过"
+  echo "  [1] $SH 已是 v8，跳过"
 fi
 
 # ---------- 2) 后端：概要取值（tdata）+ 工具集 API（hwtools）----------
@@ -220,7 +410,9 @@ __PACKAGE__->register_method({
         for my $kv (split(/,/, $param->{values} // '')) {
             $kv =~ s/^\\s+|\\s+$//g;
             next if $kv eq '';
-            die "非法参数：$kv\\n" if $kv !~ /^[a-z_]+=[0-9a-zA-Z]+$/;
+            # 值的字符类**必须允许下划线**：EPP 档位名形如 balance_performance。
+            # 只允许字母数字下划线点减号，杜绝 shell 元字符——防注入的同时不误伤合法取值。
+            die "非法参数：$kv\\n" if $kv !~ /^[a-z_]+=[0-9a-zA-Z_.-]+$/;
             push @args, $kv;
         }
         die "没有可写入的配置项\\n" if !@args;
@@ -279,7 +471,7 @@ PY
 
 # ---------- 3) 前端：概要条目 + 按配置隐藏 + 设置页 + 菜单项 ----------
 [ ! -f "$BK/pvemanagerlib.js.bak.hwpatch" ] && cp -a "$J" "$BK/pvemanagerlib.js.bak.hwpatch"
-python3 - "$J" <<'PY'
+python3 - "$J" "$0" <<'PY'
 import sys, re
 p = sys.argv[1]
 s = open(p, encoding='utf-8', errors='surrogateescape').read()
@@ -327,7 +519,7 @@ items = """            textField: 'pveversion',
             title: gettext('CPU温度'),
             textField: 'tdata',
             renderer: function (v) {
-                try { return JSON.parse(v).cpu_pkg + ' \u00b0C'; } catch (e) { return '-'; }
+                try { return JSON.parse(v).cpu_pkg + ' °C'; } catch (e) { return '-'; }
             },
         },
         {
@@ -337,7 +529,7 @@ items = """            textField: 'pveversion',
             title: gettext('主板温度'),
             textField: 'tdata',
             renderer: function (v) {
-                try { return JSON.parse(v).board + ' \u00b0C'; } catch (e) { return '-'; }
+                try { return JSON.parse(v).board + ' °C'; } catch (e) { return '-'; }
             },
         },
         {
@@ -350,7 +542,7 @@ items = """            textField: 'pveversion',
                 try {
                     return JSON.parse(v).cpu_cores.split(',').map(function (x) {
                         var q = x.split(':');
-                        return q[0] + ' ' + q[1] + ' \u00b0C';
+                        return q[0] + ' ' + q[1] + ' °C';
                     }).join(' | ');
                 } catch (e) { return '-'; }
             },
@@ -385,7 +577,7 @@ items = """            textField: 'pveversion',
                     return d.split(';').map(function (r) {
                         var q = r.split('|');
                         var t = (parseInt(q[1], 10) / 1000).toFixed(0);
-                        return q[0] + '  ' + t + ' \u00b0C  ' + q[2];
+                        return q[0] + '  ' + t + ' °C  ' + q[2];
                     }).join('      |      ');
                 } catch (e) { return '-'; }
             },
@@ -402,7 +594,15 @@ items = """            textField: 'pveversion',
                     var cur = d.cpu_cur && d.cpu_cur !== '0' ? d.cpu_cur + ' MHz' : '-';
                     var rng = (d.cpu_min && d.cpu_min !== '0' ? d.cpu_min : '-') + ' ~ ' +
                               (d.cpu_max && d.cpu_max !== '0' ? d.cpu_max + ' MHz' : '-');
-                    return cur + '  (min~max: ' + rng + ')';
+                    var out = cur + '  (min~max: ' + rng + ')';
+                    // 换行用 HTML 标签：单元格内容按 HTML 渲染，纯换行字符会被折叠成空格。
+                    // （也避免了在 Python 三引号块里写反斜杠转义。）
+                    // 代号与基准频率（CPUID 映射；AMD 机器同样适用）
+                    if (d.cpu_gen && d.cpu_gen !== '-') {
+                        out += '<br/>' + d.cpu_gen +
+                               ((d.cpu_base && d.cpu_base !== '0') ? (' · 基准 ' + d.cpu_base + ' MHz') : '');
+                    }
+                    return out;
                 } catch (e) { return '-'; }
             },
         },
@@ -410,6 +610,26 @@ items = """            textField: 'pveversion',
     ],
 """
 s = s.replace(anchor, items, 1)
+
+# 结构性护栏：这段 JS 嵌在 Python 三引号字符串里，若里面写了反斜杠转义（典型是换行写成
+# 反斜杠加 n），Python 会先把它译成真字符，从而截断 JS 字面量或注释——结果是整个
+# pvemanagerlib.js 加载失败、连登录窗都不渲染（node --check 也只报个难定位的行号）。
+# 注意：护栏必须扫**脚本原始文本**——等 Python 变量成型时反斜杠已被吃掉，查变量是查不出的。
+_src = ""
+try:
+    _src = open(sys.argv[2], encoding='utf-8').read()
+except Exception:
+    pass
+if _src:
+    _a = _src.find('items = """')
+    _b = _src.find('"""', _a + 12) if _a >= 0 else -1
+    if _a >= 0 and _b > _a:
+        _blk = _src[_a + 12:_b]
+        for _m in re.finditer(r"\\[nrtbfv0-9ux]", _blk):
+            sys.exit("ERROR: 概要条目块的源码里出现反斜杠转义：%s\n"
+                     "       请改用 HTML 标签（<br/>）或 String.fromCharCode，"
+                     "否则整份前端 JS 会加载失败。"
+                     % _blk[max(0, _m.start()-50):_m.start()+50].replace("\n", " / "))
 
 # ---- 3c) 概要面板：渲染后按配置隐藏（开关改动后无需重登）----
 home_anchor = """        let nodeStatus = Ext.create('PVE.node.StatusView', {
@@ -619,7 +839,7 @@ Ext.define('PVE.node.HwTools', {
                         },
                         {
                             xtype: 'numberfield',
-                            fieldLabel: gettext('频率下限（kHz）'),
+                            fieldLabel: gettext('频率下限（MHz）'),
                             name: 'freq_min',
                             allowDecimals: false,
                             minValue: 0,
@@ -627,11 +847,37 @@ Ext.define('PVE.node.HwTools', {
                         },
                         {
                             xtype: 'numberfield',
-                            fieldLabel: gettext('频率上限（kHz）'),
+                            fieldLabel: gettext('频率上限（MHz）'),
                             name: 'freq_max',
                             allowDecimals: false,
                             minValue: 0,
                             width: 340,
+                        },
+                        {
+                            xtype: 'combo',
+                            fieldLabel: gettext('Turbo 加速'),
+                            name: 'turbo',
+                            editable: false,
+                            forceSelection: true,
+                            queryMode: 'local',
+                            displayField: 'v',
+                            valueField: 'val',
+                            store: { fields: ['v', 'val'], data: [
+                                { v: gettext('启用'), val: '1' },
+                                { v: gettext('关闭'), val: '0' },
+                            ] },
+                        },
+                        {
+                            xtype: 'combo',
+                            fieldLabel: gettext('能效偏好（EPP）'),
+                            name: 'epp',
+                            editable: false,
+                            forceSelection: true,
+                            queryMode: 'local',
+                            displayField: 'v',
+                            valueField: 'v',
+                            emptyText: gettext('本机不支持'),
+                            store: { fields: ['v'], data: [] },
                         },
                         {
                             xtype: 'component',
@@ -697,7 +943,18 @@ Ext.define('PVE.node.HwTools', {
                 var cb = me.down('combo[name=governor]');
                 cb.getStore().loadData((d.governors || []).map(function (g) { return { v: g }; }));
 
-                // 数字框的合法范围也须在 setValues 之前设好，否则被当作越界而清空
+                // 能效偏好：仅本机支持的档位；不支持则禁用并标注
+                var cbEpp = me.down('combo[name=epp]');
+                var eppList = d.epp_list || [];
+                cbEpp.getStore().loadData(eppList.map(function (e) { return { v: e }; }));
+                cbEpp.setDisabled(!d.epp_avail || !eppList.length);
+
+                // Turbo：本机不支持则禁用
+                var cbTurbo = me.down('combo[name=turbo]');
+                cbTurbo.setDisabled(!d.turbo_avail);
+
+                // 数字框的合法范围也须在 setValues 之前设好，否则被当作越界而清空。
+                // 单位一律 MHz（状态接口已折算好）。
                 var nfMin = me.down('numberfield[name=freq_min]');
                 var nfMax = me.down('numberfield[name=freq_max]');
                 nfMin.setMinValue(d.freq_hw_min);
@@ -714,16 +971,26 @@ Ext.define('PVE.node.HwTools', {
                     governor: d.governor,
                     freq_min: parseInt(d.freq_min, 10),
                     freq_max: parseInt(d.freq_max, 10),
+                    turbo: String(d.turbo),
+                    epp: d.epp,
                 });
 
-                var hz = function (k) { return (Math.round(k / 100) / 10) + ' MHz'; };
+                var mhz = function (v) { return v + ' MHz'; };
+                var gv = (d.cpu_gen || '');
                 me.down('#freqhint').setHtml(
                     '<span style="color:#888">' +
-                    gettext('硬件能力：') + hz(d.freq_hw_min) + ' ~ ' + hz(d.freq_hw_max) +
-                    '（' + d.freq_hw_min + ' ~ ' + d.freq_hw_max + ' kHz）' +
-                    '<br/>' + gettext('内核实际生效：') + d.governor_live + '，' +
-                    hz(d.freq_min_live) + ' ~ ' + hz(d.freq_max_live) +
-                    '<br/>' + gettext('配置文件：') + d.config_file +
+                    gettext('处理器：') + gv + '<br/>' +
+                    gettext('驱动：') + (d.driver || '?') +
+                        (d.amd_pstate ? ('（amd_pstate: ' + d.amd_pstate + '）') : '') +
+                        '，' + gettext('策略数：') + (d.policies || 0) + '<br/>' +
+                    gettext('硬件能力：') + mhz(d.freq_hw_min) + ' ~ ' + mhz(d.freq_hw_max) +
+                        (d.base_freq ? ('，' + gettext('基准频率 ') + mhz(d.base_freq)) : '') + '<br/>' +
+                    gettext('内核实际生效：') + d.governor_live + '，' +
+                        mhz(d.freq_min_live) + ' ~ ' + mhz(d.freq_max_live) +
+                        '，' + gettext('当前 ') + mhz(d.freq_cur) + '<br/>' +
+                    gettext('Turbo：') + (d.turbo_avail ? (String(d.turbo) === '1' ? gettext('启用') : gettext('关闭')) : gettext('本机不支持')) +
+                        (d.epp_avail ? ('，' + gettext('EPP：') + (d.epp || '-')) : '') + '<br/>' +
+                    gettext('配置文件：') + d.config_file +
                     '</span>'
                 );
             },
@@ -748,9 +1015,20 @@ Ext.define('PVE.node.HwTools', {
             'show_cpu_freq=' + on('show_cpu_freq'),
             'block_subscription=' + on('block_subscription'),
             'governor=' + val.governor,
-            'freq_min=' + val.freq_min,
-            'freq_max=' + val.freq_max,
-        ].join(',');
+            // 单位 MHz（后端按 MHz 校验并折算成 kHz 写入内核）
+            'freq_min=' + Math.round(val.freq_min),
+            'freq_max=' + Math.round(val.freq_max),
+        ];
+        // Turbo / EPP 仅在本机支持时才提交，免得把不支持的值写进配置
+        var cbTurbo = me.down('combo[name=turbo]');
+        if (cbTurbo && !cbTurbo.isDisabled() && val.turbo !== undefined && val.turbo !== null && val.turbo !== '') {
+            kv.push('turbo=' + val.turbo);
+        }
+        var cbEpp = me.down('combo[name=epp]');
+        if (cbEpp && !cbEpp.isDisabled() && val.epp) {
+            kv.push('epp=' + val.epp);
+        }
+        kv = kv.join(',');
 
         Proxmox.Utils.API2Request({
             url: '/nodes/' + me.nodename + '/hwtools',
@@ -781,6 +1059,17 @@ if s.rstrip().endswith('// PVE_HWUI:END'):
 else:
     s = s.rstrip() + '\n' + ui
 
+# 同一道护栏，罩住设置页那一大块 JS（理由见上）。同样必须扫**源码文本**。
+if _src:
+    _a = _src.find('ui = """')
+    _b = _src.find('"""', _a + 8) if _a >= 0 else -1
+    if _a >= 0 and _b > _a:
+        _blk = _src[_a + 8:_b]
+        for _m in re.finditer(r"\\[nrtbfv0-9ux]", _blk):
+            sys.exit("ERROR: 设置页 JS 的源码里出现反斜杠转义：%s\n"
+                     "       请改用 HTML 标签（<br/>）或 String.fromCharCode。"
+                     % _blk[max(0, _m.start()-50):_m.start()+50].replace("\n", " / "))
+
 # 概要面板高度基线
 s = re.sub(r"(alias: 'widget\.pveNodeStatus',\n\n    height: )\d+(,)", r"\g<1>480\g<2>", s, count=1)
 
@@ -806,11 +1095,16 @@ else
   echo "  [3] 无 node，跳过语法校验（浏览器侧验证）"
 fi
 
-# ---------- 4) 权限代理脚本 ----------
+# ---------- 4) 权限代理与 CPU 世代映射 ----------
 if [ -x "$AGENT" ]; then
   echo "  [4] $AGENT 就位"
 else
   echo "  [4] 警告：$AGENT 不存在或不可执行，请随本脚本一同部署" >&2
+fi
+if [ -f "$CPUDB" ]; then
+  echo "  [4] $CPUDB 就位（CPU 世代映射，s.sh 与 agent 共用）"
+else
+  echo "  [4] 警告：$CPUDB 缺失，CPU 代号将退化为 family/model" >&2
 fi
 
 # ---------- 5) 开机自启：施加调频 + 重渲染 ----------

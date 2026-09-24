@@ -1,23 +1,26 @@
 #!/bin/bash
-# pve-hwtools-agent —— PVE 工具集状态代理
+# pve-hwtools-agent —— PVE 工具集状态代理（V2.1）
 #
 # 唯一的配置真相：/etc/default/pve-hwtools
 # 职责：读/写该配置；施加 CPU 调频；按配置触发界面重渲染。
 #
-# 由 PVE 面板「PVE 工具集」页经节点级 API（/nodes/{node}/hwtools）调用；也可手工执行：
+# 由面板「PVE 工具集」页经节点级 API（/nodes/{node}/hwtools）调用；也可手工执行：
 #   pve-hwtools-agent status
-#   pve-hwtools-agent set show_fan=0 governor=performance freq_max=3800000
+#   pve-hwtools-agent set show_fan=0 governor=performance freq_max=3800 turbo=0
 #   pve-hwtools-agent apply          # 按配置重新施加调频并重渲染（开机自启用）
+#
+# 单位约定：**配置文件与界面一律用 MHz**（自 V2.1 起）。内核 sysfs 用 kHz，
+# 内部换算；若读到大于 10000 的旧值（历史 kHz 写法）自动按 kHz 解释，便于平滑迁移。
 set -u
 
 CONF=/etc/default/pve-hwtools
 RENDER=/usr/local/bin/pve-hwpatch.sh
-CP=/sys/devices/system/cpu/cpu0/cpufreq
+CPUS=/sys/devices/system/cpu
 
 die() { echo "错误：$*" >&2; exit 1; }
 need_root() { [ "$(id -u)" = 0 ] || die "需要 root 权限"; }
 
-# ---------- 缺省值 ----------
+# ---------- 缺省值（MHz） ----------
 defaults() {
   SHOW_CPU_TEMP=1
   SHOW_FAN=1
@@ -25,37 +28,114 @@ defaults() {
   SHOW_CPU_FREQ=1
   BLOCK_SUBSCRIPTION_PROMPT=1
   CPU_GOVERNOR=conservative
-  CPU_FREQ_MIN=800000
-  CPU_FREQ_MAX=3800000
+  CPU_FREQ_MIN=800
+  CPU_FREQ_MAX=3800
+  CPU_TURBO=1
+  CPU_EPP=balance_performance
 }
+
+# 把可能是历史 kHz 写法的值折算成 MHz（>10000 视为 kHz）
+to_mhz() {
+  case "$1" in
+    ''|*[!0-9]*) printf '%s' "$1" ;;
+    *) if [ "$1" -gt 10000 ]; then echo $(( $1 / 1000 )); else printf '%s' "$1"; fi ;;
+  esac
+}
+
 load_conf() {
   defaults
-  [ -f "$CONF" ] && . "$CONF"
+  if [ -f "$CONF" ]; then
+    . "$CONF"
+    CPU_FREQ_MIN=$(to_mhz "$CPU_FREQ_MIN")
+    CPU_FREQ_MAX=$(to_mhz "$CPU_FREQ_MAX")
+  fi
   return 0
 }
 
-# ---------- 硬件事实（一律现读，不缓存）----------
-hw_min() { cat "$CP/cpuinfo_min_freq" 2>/dev/null || echo 800000; }
-hw_max() { cat "$CP/cpuinfo_max_freq" 2>/dev/null || echo 4300000; }
-live_gov() { cat "$CP/scaling_governor" 2>/dev/null || echo unknown; }
-live_min() { cat "$CP/scaling_min_freq" 2>/dev/null || echo 0; }
-live_max() { cat "$CP/scaling_max_freq" 2>/dev/null || echo 0; }
+# ---------- 策略（policy）枚举：优先 cpufreq/policy*，退化为 cpu*/cpufreq ----------
+policies() {
+  local d c
+  set -- $CPUS/cpufreq/policy[0-9]*
+  if [ -d "$1" ]; then
+    for d in $CPUS/cpufreq/policy[0-9]*; do [ -d "$d" ] && echo "$d"; done
+    return
+  fi
+  for c in $CPUS/cpu[0-9]*; do [ -d "$c/cpufreq" ] && echo "$c/cpufreq"; done
+}
 
-# 可用调速器：用户列的五种优先，再补内核上报的其它（去掉 userspace）
+cpufreq_ok() { [ -d "$CPUS/cpu0/cpufreq" ] || [ -d "$(policies | head -1)" ]; }
+
+# ---------- 硬件事实（一律现读，不缓存；单位 kHz） ----------
+hw_min_khz() {
+  local m="" v
+  for p in $(policies); do v=$(cat "$p/cpuinfo_min_freq" 2>/dev/null); [ -n "$v" ] || continue
+    if [ -z "$m" ] || [ "$v" -lt "$m" ]; then m=$v; fi; done
+  printf '%s' "${m:-0}"
+}
+hw_max_khz() {
+  local m="" v
+  for p in $(policies); do v=$(cat "$p/cpuinfo_max_freq" 2>/dev/null); [ -n "$v" ] || continue
+    if [ -z "$m" ] || [ "$v" -gt "$m" ]; then m=$v; fi; done
+  printf '%s' "${m:-0}"
+}
+live_gov()  { local g=""; for p in $(policies); do g=$(cat "$p/scaling_governor" 2>/dev/null); break; done; printf '%s' "${g:-unknown}"; }
+live_min()  { local m="" v; for p in $(policies); do v=$(cat "$p/scaling_min_freq" 2>/dev/null); [ -n "$v" ] || continue
+              if [ -z "$m" ] || [ "$v" -lt "$m" ]; then m=$v; fi; done; printf '%s' "${m:-0}"; }
+live_max()  { local m="" v; for p in $(policies); do v=$(cat "$p/scaling_max_freq" 2>/dev/null); [ -n "$v" ] || continue
+              if [ -z "$m" ] || [ "$v" -gt "$m" ]; then m=$v; fi; done; printf '%s' "${m:-0}"; }
+live_cur()  { local c=""; for p in $(policies); do c=$(cat "$p/scaling_cur_freq" 2>/dev/null); break; done; printf '%s' "${c:-0}"; }
+base_khz()  { local v; v=$(cat "$(policies | head -1)/base_frequency" 2>/dev/null); printf '%s' "${v:-0}"; }
+cpudriver() { local v; v=$(cat "$(policies | head -1)/scaling_driver" 2>/dev/null); printf '%s' "${v:-unknown}"; }
+
+# 离散频率表（老式 acpi-cpufreq 才有）
+avail_freqs() { local v; v=$(cat "$(policies | head -1)/scaling_available_frequencies" 2>/dev/null); printf '%s' "$v"; }
+
+# 可用调速器：用户列的五种中仅保留内核确实支持者，再补内核上报的其它（去掉 userspace）
+avail_govs() { local a=""; a=$(cat "$(policies | head -1)/scaling_available_governors" 2>/dev/null); printf '%s' "$a"; }
 gov_list() {
   local all out="" g
-  all=$(cat "$CP/scaling_available_governors" 2>/dev/null)
+  all=$(avail_govs)
+  if [ -z "$all" ]; then printf 'performance,powersave,ondemand,conservative,schedutil'; return; fi
   for g in performance powersave ondemand conservative schedutil; do
     case " $all " in *" $g "*) out="$out$g," ;; esac
   done
   for g in $all; do
-    case "$g" in
-      userspace|performance|powersave|ondemand|conservative|schedutil) ;;
-      *) out="$out$g," ;;
-    esac
+    case "$g" in userspace|performance|powersave|ondemand|conservative|schedutil) ;; *) out="$out$g," ;; esac
   done
   printf '%s' "${out%,}"
 }
+
+# ---------- Turbo / EPP 能力探测 ----------
+# Turbo：老 acpi-cpufreq 用 cpufreq/boost（1 开），现代 intel_pstate 用 intel_pstate/no_turbo（1 关，取反）
+turbo_file() {
+  local f
+  for f in $CPUS/cpufreq/boost $CPUS/intel_pstate/no_turbo; do [ -e "$f" ] && { printf '%s' "$f"; return 0; }; done
+  return 1
+}
+turbo_invert() { case "$1" in *no_turbo) return 0 ;; *) return 1 ;; esac; }
+turbo_get() {
+  local f; f=$(turbo_file) || { printf 'none'; return; }
+  local v; v=$(cat "$f" 2>/dev/null)
+  if turbo_invert "$f"; then [ "$v" = "1" ] && printf '0' || printf '1'; else printf '%s' "${v:-0}"; fi
+}
+turbo_avail() { turbo_file >/dev/null 2>&1 && printf '1' || printf '0'; }
+epp_avail() { [ -e "$(policies | head -1)/energy_performance_preference" ] && printf '1' || printf '0'; }
+epp_names() { cat "$(policies | head -1)/energy_performance_available_preferences" 2>/dev/null; }
+epp_cur()   { cat "$(policies | head -1)/energy_performance_preference" 2>/dev/null; }
+apstate_status() { cat $CPUS/amd_pstate/status 2>/dev/null; }
+
+# ---------- CPU 身份与世代（映射见共享文件 cpu-model.sh）----------
+# 共享文件由 pve-hwpatch.sh 落盘到 /usr/local/lib/pve-hwtools/；
+# 万一身处早期升级态而文件缺失，退化为「family/model」直读，绝不因此报错。
+CPU_MODEL_SH=/usr/local/lib/pve-hwtools/cpu-model.sh
+if [ -r "$CPU_MODEL_SH" ]; then
+  . "$CPU_MODEL_SH"
+else
+  cpu_vendor() { grep -m1 '^vendor_id' /proc/cpuinfo 2>/dev/null | awk '{print $3}'; }
+  cpu_fam()    { grep -m1 '^cpu family' /proc/cpuinfo 2>/dev/null | awk '{print $4}'; }
+  cpu_mod()    { grep -m1 '^model' /proc/cpuinfo 2>/dev/null | head -1 | sed 's/^model[[:space:]]*:[[:space:]]*//'; }
+  cpu_gen()    { printf '%s family %s model %s' "$(cpu_vendor)" "$(cpu_fam)" "$(cpu_mod)"; }
+fi
 
 # ---------- 校验 ----------
 valid_gov() {
@@ -63,21 +143,26 @@ valid_gov() {
   for g in $(gov_list | tr ',' ' '); do
     [ "$g" = "$v" ] && { printf '%s' "$v"; return 0; }
   done
-  die "不支持的调频模式「$v」。可用：$(gov_list | tr ',' ' ')"
+  die "不支持的调频模式「$v」。本机可用：$(gov_list | tr ',' ' ')"
 }
-valid_freq() {
-  local v="$1" hmin hmax
-  case "$v" in ''|*[!0-9]*) die "频率必须是纯数字（单位 kHz）：$v" ;; esac
-  hmin=$(hw_min); hmax=$(hw_max)
-  [ "$v" -lt "$hmin" ] && die "频率 $v kHz 低于硬件下限 $hmin kHz"
-  [ "$v" -gt "$hmax" ] && die "频率 $v kHz 高于硬件上限 $hmax kHz"
-  printf '%s' "$v"
+# 频率：**输入为 MHz**，返回 kHz（供写 sysfs）。同时接受历史 kHz 写法。
+valid_freq_mhz() {
+  local v="$1" hmin hmax mhz
+  case "$v" in ''|*[!0-9]*) die "频率必须是纯数字（单位 MHz）：$v" ;; esac
+  if [ "$v" -gt 10000 ]; then mhz=$(( v / 1000 )); else mhz=$v; fi   # 兼容历史 kHz
+  hmin=$(( $(hw_min_khz) / 1000 )); hmax=$(( $(hw_max_khz) / 1000 ))
+  [ "$mhz" -lt "$hmin" ] && die "频率 $mhz MHz 低于硬件下限 $hmin MHz"
+  [ "$mhz" -gt "$hmax" ] && die "频率 $mhz MHz 高于硬件上限 $hmax MHz"
+  printf '%s' "$(( mhz * 1000 ))"
 }
-valid_01() {
-  case "$1" in 0|1) printf '%s' "$1" ;; *) die "开关只能是 0 或 1：$1" ;; esac
+valid_01() { case "$1" in 0|1) printf '%s' "$1" ;; *) die "开关只能是 0 或 1：$1" ;; esac; }
+valid_epp() {
+  local v="$1" g
+  for g in $(epp_names); do [ "$g" = "$v" ] && { printf '%s' "$v"; return 0; }; done
+  die "不支持的能效偏好「$v」。本机可用：$(epp_names | tr '\n' ' ')"
 }
 
-# ---------- 写配置 ----------
+# ---------- 写配置（MHz） ----------
 write_conf() {
   cat > "$CONF" <<EOF
 # PVE 工具集配置 —— 由面板「PVE 工具集」页生成，也可手工编辑
@@ -92,37 +177,79 @@ SHOW_CPU_FREQ=$SHOW_CPU_FREQ
 # 屏蔽「无有效订阅」弹窗
 BLOCK_SUBSCRIPTION_PROMPT=$BLOCK_SUBSCRIPTION_PROMPT
 #
-# CPU 调频（频率单位 kHz；范围须落在硬件能力内）
+# CPU 调频（频率单位 **MHz**；范围须落在硬件能力内）
 CPU_GOVERNOR=$CPU_GOVERNOR
 CPU_FREQ_MIN=$CPU_FREQ_MIN
 CPU_FREQ_MAX=$CPU_FREQ_MAX
+# Turbo（1 启用 / 0 关闭；本机不支持时该项被忽略）
+CPU_TURBO=$CPU_TURBO
+# 能效偏好 EPP（仅部分新平台支持：performance / balance_performance / balance_power / power）
+CPU_EPP=$CPU_EPP
 EOF
   chmod 644 "$CONF"
 }
 
 # ---------- 施加 CPU 调频 ----------
-apply_freq() {
-  local out
-  out=$(cpupower frequency-set -g "$CPU_GOVERNOR" -d "$CPU_FREQ_MIN" -u "$CPU_FREQ_MAX" 2>&1) \
-    || die "设置 CPU 调频失败：$out"
-  # 复核：内核会把越界值钳到硬件范围，读回确认真实生效值
-  [ "$(live_gov)" = "$CPU_GOVERNOR" ] \
-    || die "调频模式未生效：期望 $CPU_GOVERNOR，实际 $(live_gov)"
+# 逐策略写 sysfs（内核自身接口，最通用）；写完回读校验，不符则用 cpupower 兜底一次。
+apply_one() {   # $1=policy 目录  $2=governor（空则不动）  $3=min kHz  $4=max kHz
+  local p=$1 g=$2 lo=$3 hi=$4
+  [ -e "$p/scaling_min_freq" ] && printf '%s' "$lo" > "$p/scaling_min_freq" 2>/dev/null
+  [ -e "$p/scaling_max_freq" ] && printf '%s' "$hi" > "$p/scaling_max_freq" 2>/dev/null
+  [ -n "$g" ] && [ -e "$p/scaling_governor" ] && printf '%s' "$g" > "$p/scaling_governor" 2>/dev/null
   return 0
 }
-try_apply_freq() {
-  command -v cpupower >/dev/null 2>&1 || return 0
-  apply_freq
+apply_freq() {
+  local g="$CPU_GOVERNOR" lo=$(( CPU_FREQ_MIN * 1000 )) hi=$(( CPU_FREQ_MAX * 1000 ))
+  local p bad=0
+  cpufreq_ok || die "本机无 cpufreq 接口，无法设置调频（旧内核或禁用了调频驱动）"
+  for p in $(policies); do apply_one "$p" "$g" "$lo" "$hi" || bad=1; done
+
+  local lg lm lx
+  lg=$(live_gov); lm=$(live_min); lx=$(live_max)
+  if [ "$lg" != "$g" ] || [ "$lm" != "$lo" ] || [ "$lx" != "$hi" ]; then
+    # 兜底：部分驱动只认 cpupower 的组合设置
+    if command -v cpupower >/dev/null 2>&1; then
+      cpupower frequency-set -g "$g" -d "${CPU_FREQ_MIN}MHz" -u "${CPU_FREQ_MAX}MHz" >/dev/null 2>&1 || true
+      lg=$(live_gov); lm=$(live_min); lx=$(live_max)
+    fi
+    bad=0
+    [ "$lg" != "$g" ] && bad=1
+    [ "$lm" != "$lo" ] && bad=1
+    [ "$lx" != "$hi" ] && bad=1
+  fi
+  [ "$bad" = 0 ] || die "调频未按预期生效：期望 $g ${CPU_FREQ_MIN}MHz~${CPU_FREQ_MAX}MHz，实际 $lg $((lm/1000))MHz~$((lx/1000))MHz"
+  return 0
+}
+apply_turbo() {
+  local f; f=$(turbo_file) || return 0
+  local want="$CPU_TURBO" v
+  if turbo_invert "$f"; then [ "$want" = "1" ] && v=0 || v=1; else v="$want"; fi
+  printf '%s' "$v" > "$f" 2>/dev/null || return 0
+  return 0
+}
+apply_epp() {
+  local p base="$CPU_EPP"
+  epp_avail >/dev/null || return 0
+  [ -n "$base" ] || return 0
+  for p in $(policies); do
+    [ -e "$p/energy_performance_preference" ] || continue
+    case " $(epp_names) " in *" $base "*) printf '%s' "$base" > "$p/energy_performance_preference" 2>/dev/null ;; esac
+  done
+  return 0
 }
 
-# ---------- 状态（JSON）----------
+# ---------- 状态（JSON，频率一律 MHz） ----------
 emit_status() {
   load_conf
   local jg="" g
   for g in $(gov_list | tr ',' ' '); do jg="$jg\"$g\","; done
   jg="${jg%,}"
+  local je="" e
+  for e in $(epp_names); do case "$e" in default) ;; *) je="$je\"$e\"," ;; esac; done
+  je="${je%,}"
+  local base; base=$(base_khz)
   cat <<EOF
-{"show_cpu_temp":$SHOW_CPU_TEMP,"show_fan":$SHOW_FAN,"show_disk":$SHOW_DISK,"show_cpu_freq":$SHOW_CPU_FREQ,"block_subscription":$BLOCK_SUBSCRIPTION_PROMPT,"governor":"$CPU_GOVERNOR","freq_min":$CPU_FREQ_MIN,"freq_max":$CPU_FREQ_MAX,"governor_live":"$(live_gov)","freq_min_live":$(live_min),"freq_max_live":$(live_max),"freq_hw_min":$(hw_min),"freq_hw_max":$(hw_max),"config_file":"$CONF","governors":[$jg]}
+{"show_cpu_temp":$SHOW_CPU_TEMP,"show_fan":$SHOW_FAN,"show_disk":$SHOW_DISK,"show_cpu_freq":$SHOW_CPU_FREQ,"block_subscription":$BLOCK_SUBSCRIPTION_PROMPT,"governor":"$CPU_GOVERNOR","governors":[$jg],"freq_min":$CPU_FREQ_MIN,"freq_max":$CPU_FREQ_MAX,"governor_live":"$(live_gov)","freq_min_live":$(( $(live_min) / 1000 )),"freq_max_live":$(( $(live_max) / 1000 )),"freq_cur":$(( $(live_cur) / 1000 )),"freq_hw_min":$(( $(hw_min_khz) / 1000 )),"freq_hw_max":$(( $(hw_max_khz) / 1000 )),"base_freq":$(( base / 1000 )),"turbo":$(turbo_get),"turbo_avail":$(turbo_avail),"epp":"$(epp_cur)","epp_avail":$(epp_avail),"epp_list":[$je],"driver":"$(cpudriver)","amd_pstate":"$(apstate_status)","policies":$(policies | wc -l),"cpufreq_ok":$(cpufreq_ok && echo 1 || echo 0),"cpu_brand":"$(cpu_brand)","cpu_gen":"$(cpu_gen)","cpu_vendor":"$(cpu_vendor)","config_file":"$CONF"}
 EOF
 }
 
@@ -135,9 +262,9 @@ cmd_set() {
   [ $# -gt 0 ] || die "set 需要至少一个 k=v 参数"
 
   local gov="$CPU_GOVERNOR" fmin="$CPU_FREQ_MIN" fmax="$CPU_FREQ_MAX"
-  local freq_changed=0 kv k v
+  local turbo="$CPU_TURBO" epp="$CPU_EPP"
+  local freq_changed=0 other_changed=0 kv k v
 
-  # 先全部校验，通过后才落盘与生效
   for kv in "$@"; do
     k="${kv%%=*}"; v="${kv#*=}"
     case "$k" in
@@ -147,17 +274,26 @@ cmd_set() {
       show_cpu_freq) SHOW_CPU_FREQ=$(valid_01 "$v") ;;
       block_subscription) BLOCK_SUBSCRIPTION_PROMPT=$(valid_01 "$v") ;;
       governor) gov=$(valid_gov "$v"); freq_changed=1 ;;
-      freq_min) fmin=$(valid_freq "$v"); freq_changed=1 ;;
-      freq_max) fmax=$(valid_freq "$v"); freq_changed=1 ;;
+      freq_min) fmin=$(( $(valid_freq_mhz "$v") / 1000 )); freq_changed=1 ;;
+      freq_max) fmax=$(( $(valid_freq_mhz "$v") / 1000 )); freq_changed=1 ;;
+      turbo) turbo=$(valid_01 "$v"); other_changed=1 ;;
+      epp) epp=$(valid_epp "$v"); other_changed=1 ;;
       *) die "未知配置项：$k" ;;
     esac
   done
-  [ "$fmin" -le "$fmax" ] || die "频率下限（$fmin kHz）不能高于上限（$fmax kHz）"
+  [ "$fmin" -le "$fmax" ] || die "频率下限（$fmin MHz）不能高于上限（$fmax MHz）"
+  if [ "$freq_changed" = 1 ]; then
+    local flim=$(( $(hw_min_khz) / 1000 )) hlim=$(( $(hw_max_khz) / 1000 ))
+    [ "$fmin" -ge "$flim" ] || die "频率下限 $fmin MHz 低于硬件下限 $flim MHz"
+    [ "$fmax" -le "$hlim" ] || die "频率上限 $fmax MHz 高于硬件上限 $hlim MHz"
+  fi
 
   CPU_GOVERNOR="$gov"; CPU_FREQ_MIN="$fmin"; CPU_FREQ_MAX="$fmax"
+  CPU_TURBO="$turbo"; CPU_EPP="$epp"
 
   # 先生效；失败则不落盘（保证配置与系统状态一致）
   if [ "$freq_changed" = 1 ]; then apply_freq; fi
+  if [ "$other_changed" = 1 ]; then apply_turbo; apply_epp; fi
 
   write_conf
   if [ -x "$RENDER" ]; then "$RENDER" >/dev/null 2>&1; fi
@@ -167,7 +303,9 @@ cmd_set() {
 cmd_apply() {
   need_root
   load_conf
-  try_apply_freq
+  if cpufreq_ok; then apply_freq 2>/dev/null || true; fi
+  apply_turbo
+  apply_epp
   if [ -x "$RENDER" ]; then "$RENDER" >/dev/null 2>&1; fi
   emit_status
 }

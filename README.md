@@ -1,6 +1,6 @@
 # Proxmox VE 面板补丁集
 
-> **当前版本：V2.0** · 发布于 2026-09-24
+> **当前版本：V2.1** · 发布于 2026-09-24
 
 自用的 PVE Web 界面增强补丁，纯 shell，无第三方依赖（除系统已有的 python3 / lm-sensors）。
 
@@ -20,7 +20,7 @@
 - **CPU 各核** —— 带核名：`Core 0 43.0 °C | Core 1 42.0 °C | ...`
 - **风扇转速** —— 带路名：`Fan 1 1053 RPM | Fan 2 1331 RPM`（只列非零）
 - **硬盘温度** —— 型号 + 容量 + 温度：`Lexar SSD NM620 512GB 40 °C 512G`（NVMe 走 hwmon，SATA 走 smartctl）
-- CPU 频率（实时 / 最小 / 最大）
+- CPU 频率（实时 / 最小 / 最大 MHz）——下方第二行显示 **CPU 代号与基准频率**（由 CPUID 映射，如 `Alder Lake (12th Gen Core) · 基准 3300 MHz`）
 
 四项**可分别开关**（见下「设置页」），关掉的条目连同占位一起隐藏，面板高度随之收缩。
 
@@ -31,7 +31,7 @@ PVE 原生界面不显示这些；此前常用 pvetools 的 `chSensors` 实现�
 在节点左菜单（**System → PVE 工具集**）新增一页，三组：
 
 1. **概要显示** —— 四个勾选框：CPU 温度（含各核）、风扇转速、硬盘概要（型号 / 容量 / 温度）、CPU 频率
-2. **CPU 调频** —— 调频模式下拉（`performance` / `powersave` / `ondemand` / `conservative` / `schedutil`）+ 频率下限 / 上限数字框（kHz，**受硬件能力钳制**；下方实时显示硬件范围与内核实际生效值）
+2. **CPU 调频** —— 调频模式下拉（`performance` / `powersave` / `ondemand` / `conservative` / `schedutil`）+ **频率下限 / 上限数字框（MHz，受硬件能力钳制）** + **Turbo 加速**（启用 / 关闭）+ **能效偏好 EPP**（`performance` / `balance_performance` / `balance_power` / `power`，仅部分平台支持时可用）。下方灰字实时显示本机 CPU 型号与代号、驱动、硬件能力范围、内核实际生效值与当前频率
 3. **订阅提示** —— 勾选即屏蔽「无有效订阅」登录弹窗（取消勾选即恢复）
 
 「保存并应用」**真写系统**：调频模式与上下限经 `cpupower frequency-set` 落内核，可随时改回。
@@ -46,15 +46,18 @@ SHOW_DISK=1
 SHOW_CPU_FREQ=1
 BLOCK_SUBSCRIPTION_PROMPT=1
 CPU_GOVERNOR=conservative
-CPU_FREQ_MIN=800000
-CPU_FREQ_MAX=3800000
+CPU_FREQ_MIN=800          # 单位 MHz
+CPU_FREQ_MAX=3800         # 单位 MHz
+CPU_TURBO=1               # Turbo 加速：1 启用 / 0 关闭
+CPU_EPP=balance_performance   # 能效偏好（仅部分平台）
 ```
 
 #### 它改了什么
 
 | 文件 | 改动 |
 |---|---|
-| `/usr/bin/s.sh` | 新建：取样脚本，输出单行 JSON（纯 ASCII 数值） |
+| `/usr/bin/s.sh` | 新建：取样脚本，输出单行 JSON（纯 ASCII 数值，频率单位 MHz） |
+| `/usr/local/lib/pve-hwtools/cpu-model.sh` | 新建：CPUID（family/model）→ Intel/AMD 代号映射；`s.sh` 与 `pve-hwtools-agent` 共用 |
 | `/usr/share/perl5/PVE/API2/Nodes.pm` | 注入 `$res->{tdata}`；并注册节点级接口 `GET/PUT /nodes/{node}/hwtools`（PUT 带 `protected => 1`，见下） |
 | `/usr/share/pve-manager/js/pvemanagerlib.js` | 在 `PVE.node.StatusView` 的 items 里插入 `hw-*` 条目（`PVE_HWPATCH:BEGIN/END` 包裹），加隐藏逻辑与设置页，左菜单加菜单项 |
 | `/usr/local/bin/pve-hwtools-agent` | 状态代理（配置读写、调频、重渲染） |
@@ -145,7 +148,18 @@ pvesh get /nodes/<节点名>/hwtools --output-format json
 
 8. **适配版本。** 在 PVE 9.2（`pve-manager` 9.2.20 / `proxmox-widget-toolkit` 5.2.10）上实测通过。锚点是按 9.2 的源码结构找的，跨大版本升级后若 PVE 改了 `StatusView` 结构，锚点可能失配——脚本会自动报错并回滚，届时按报错提示调整锚点即可。
 
+9. **注入块里别写反斜杠转义——包括注释。**
+   前端 JS 是嵌在补丁脚本内 Python 三引号字符串里的；写了反斜杠加 `n` / `u` / `t` 之类，Python 会**先**把它译成真字符，从而截断 JS 字面量或注释，结果整个 `pvemanagerlib.js` 加载失败、连登录窗都不渲染。换行用 HTML 标签（`<br/>`）或 `String.fromCharCode`，度数符号直接写 `°`。脚本内已加护栏：一旦在注入块源码里发现反斜杠转义就拒绝注入、保持原文件不动。
+
 ## 更新日志
+
+### V2.1 · 2026-09-24
+- **频率单位由 kHz 改为 MHz**（面板输入、配置文件、状态回显、概要显示全部统一）
+- **新增 Turbo 加速开关**（`/sys/devices/system/cpu/intel_pstate/no_turbo`；不支持的平台自动禁用该控件）
+- **新增能效偏好 EPP**（四档，仅平台支持 `/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference` 时可用）
+- **新增 CPUID → 代号映射**：内置 2000 年至今主流 Intel（family 6 全部型号，98 项）与 AMD（family 0xF / 0x10 / 0x17 / 0x19 / 0x1A）代号；面板显示「处理器：xxx」、概要页第二行显示「代号 · 基准频率」。映射抽成 `/usr/local/lib/pve-hwtools/cpu-model.sh`，`s.sh` 与 `pve-hwtools-agent` 共用
+- 修复后端参数校验拒绝含下划线的取值（EPP 档位名如 `balance_performance` 曾被误拒）
+- 修复注入块内反斜杠转义被 Python 提前求值、导致整份前端 JS 加载失败的问题；并加护栏（踩坑 9）
 
 ### V2.0 · 2026-09-24
 - **新增「PVE 工具集」设置页**（节点左菜单 System 下），三组：概要显示开关 / CPU 调频 / 订阅提示
