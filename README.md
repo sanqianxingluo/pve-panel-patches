@@ -1,6 +1,6 @@
 # Proxmox VE 面板补丁集
 
-> **当前版本：V2.1** · 发布于 2026-09-24
+> **当前版本：V2.2** · 发布于 2026-09-24
 
 自用的 PVE Web 界面增强补丁，纯 shell，无第三方依赖（除系统已有的 python3 / lm-sensors）。
 
@@ -8,9 +8,11 @@
 
 | 文件 | 作用 |
 |---|---|
+| `install.sh` | **一键部署 / 卸载**（装依赖、放脚本、挂 apt 钩子、自检） |
 | `pve-hwpatch.sh` | 概要页硬件信息 + 「PVE 工具集」设置页 + 注入后端 API |
 | `pve-hwtools-agent` | 状态代理：读写配置、施加 CPU 调频、触发界面重渲染 |
 | `pve-nosub-patch.sh` | 按配置屏蔽 / 恢复「无有效订阅」弹窗（双向可逆） |
+| `SHA256SUMS` | 四个脚本的校验和（`install.sh` 下载后会自动核对） |
 
 ### `pve-hwpatch.sh` —— 节点概要显示硬件信息
 
@@ -63,7 +65,25 @@ CPU_EPP=balance_performance   # 能效偏好（仅部分平台）
 | `/usr/local/bin/pve-hwtools-agent` | 状态代理（配置读写、调频、重渲染） |
 | `/etc/default/pve-hwtools` | 配置真相 |
 
-#### 安装
+#### 安装（推荐：一键脚本）
+
+在 **PVE 宿主**上以 root 执行（会自动装依赖、放脚本、挂 apt 钩子，并在结尾自检）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sanqianxingluo/pve-panel-patches/main/install.sh | bash
+```
+
+也可以先克隆再本地跑（`--help` 看全部参数）：
+
+```bash
+git clone https://github.com/sanqianxingluo/pve-panel-patches.git
+cd pve-panel-patches
+bash install.sh                 # 安装（幂等，可反复跑）
+bash install.sh --uninstall     # 卸载：摘钩子、还原原厂文件、清补丁
+```
+
+<details>
+<summary>或手工部署（想自己掌控每一步时）</summary>
 
 ```bash
 # 依赖
@@ -76,6 +96,10 @@ install -m 755 pve-hwtools-agent /usr/local/bin/pve-hwtools-agent
 install -m 755 pve-nosub-patch.sh /usr/local/bin/pve-nosub-patch.sh
 /usr/local/bin/pve-hwpatch.sh                  # 打补丁（幂等，可反复跑）
 ```
+
+</details>
+
+> **只需那三个文件**：`cpu-model.sh`（CPUID→代号映射）、`s.sh`、`/etc/default/pve-hwtools` 与 systemd 单元都由 `pve-hwpatch.sh` 自行落盘。
 
 #### 关键：让它经得住升级
 
@@ -152,6 +176,14 @@ pvesh get /nodes/<节点名>/hwtools --output-format json
    前端 JS 是嵌在补丁脚本内 Python 三引号字符串里的；写了反斜杠加 `n` / `u` / `t` 之类，Python 会**先**把它译成真字符，从而截断 JS 字面量或注释，结果整个 `pvemanagerlib.js` 加载失败、连登录窗都不渲染。换行用 HTML 标签（`<br/>`）或 `String.fromCharCode`，度数符号直接写 `°`。脚本内已加护栏：一旦在注入块源码里发现反斜杠转义就拒绝注入、保持原文件不动。
 
 ## 更新日志
+
+### V2.2 · 2026-09-24
+- **新增 `install.sh` 一键部署 / 卸载脚本**：自动装依赖、放脚本、挂 apt 钩子、结尾自检；`--uninstall` 完整还原
+  - 支持 `curl … | bash` 与本地运行两种方式；`--ref` 指定版本、`--no-deps` 跳过依赖
+  - 下载后自动核对 `SHA256SUMS`，不符即中止
+- **卸载改为「重装包 → 剥离注入」两级还原**：优先 `apt install --reinstall pve-manager proxmox-widget-toolkit`；离线时则剥离所有注入块并把面板高度复位成原厂值。实测剥离后与当前版本原厂文件**逐字节一致**
+- **修：备份文件可能过期导致回滚错版本。** 原逻辑「备份不存在才建」，PVE 大版本升级后旧备份仍是上一版原厂件；一旦注入失败回滚到它，就会把 9.2 的文件退回 8.4.19、`pvedaemon` 起不来。现改为**仅在文件干净（无补丁标记）时才刷新备份**
+- 另修：剥离注入时的标记名要与脚本一致（`PVE_` 前缀不可省），否则一条也剥不掉
 
 ### V2.1 · 2026-09-24
 - **频率单位由 kHz 改为 MHz**（面板输入、配置文件、状态回显、概要显示全部统一）

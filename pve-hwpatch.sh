@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V2.1
+# 版本：V2.2
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -337,7 +337,16 @@ fi
 # ---------- 2) 后端：概要取值（tdata）+ 工具集 API（hwtools）----------
 # 每次都「先剥旧块、再重新注入」——不能因为「已含标记」就跳过，
 # 否则补丁自身的升级（例如后来才补上的 protected => 1）永远装不进去。
-[ ! -f "$BK/Nodes.pm.bak.hwpatch" ] && cp -a "$N" "$BK/Nodes.pm.bak.hwpatch"
+#
+# 备份策略：只在**当前文件干净（无补丁标记）**时才（重新）备份。
+#   不可只判「备份不存在」——PVE 大版本升级后原厂文件已换新，
+#   而旧备份仍是上一版的原厂件；一旦注入失败回滚到旧版本文件，
+#   就会让 9.2 的 Nodes.pm 退回 8.4.19，且 pvedaemon 起不来。
+#   故：文件干净 → 刷新备份；文件带标记 → 保留原备份（此时若失败，
+#   注入函数的「删块并复原」是唯一正确回退，绝不用备份覆盖）。
+if ! grep -q "PVE_HWPATCH\|PVE_HWAPI" "$N" 2>/dev/null; then
+  cp -a "$N" "$BK/Nodes.pm.bak.hwpatch"
+fi
 python3 - "$N" <<'PY'
 import sys, re
 p = sys.argv[1]
@@ -470,7 +479,10 @@ PY
   fi
 
 # ---------- 3) 前端：概要条目 + 按配置隐藏 + 设置页 + 菜单项 ----------
-[ ! -f "$BK/pvemanagerlib.js.bak.hwpatch" ] && cp -a "$J" "$BK/pvemanagerlib.js.bak.hwpatch"
+# 备份策略同第 2 段：只在文件干净时刷新备份，绝不用旧版原厂件覆盖新版本文件。
+if ! grep -q "PVE_HWPATCH\|PVE_HWUI" "$J" 2>/dev/null; then
+  cp -a "$J" "$BK/pvemanagerlib.js.bak.hwpatch"
+fi
 python3 - "$J" "$0" <<'PY'
 import sys, re
 p = sys.argv[1]
