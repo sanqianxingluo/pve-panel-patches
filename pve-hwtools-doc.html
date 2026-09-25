@@ -33,7 +33,7 @@
 <div class="pve-hwtools-doc">
 <h1>Proxmox VE 面板补丁集</h1>
 <blockquote>
-<p><strong>当前版本：V2.15</strong> · 发布于 2026-09-25
+<p><strong>当前版本：V3.0</strong> · 发布于 2026-09-25
 适用：<strong>Proxmox VE 9.x</strong>（在 <code>pve-manager</code> 9.2.20 上实测通过）· 需 root</p>
 </blockquote>
 <p>给 PVE 原生 Web 界面补上它不显示的东西：<strong>节点概要的硬件信息</strong>、
@@ -80,6 +80,11 @@
 <td><strong>使用说明</strong></td>
 <td>System → PVE 工具集</td>
 <td>页面内弹窗查看完整说明书（与仓库 README 同源）</td>
+</tr>
+<tr>
+<td><strong>系统更新</strong></td>
+<td>System → PVE 工具集</td>
+<td>检查更新 / 更新 PVE 软件 / 更新内核；更新前自动保留旧内核，可一键回退</td>
 </tr>
 </tbody>
 </table>
@@ -308,7 +313,67 @@ pvesh get /nodes/&lt;节点名&gt;/hwtools --output-format json
 另外只改<strong>认得出的公共镜像</strong>，自家内网仓库等自定义源<strong>原样保留</strong>。</p>
 <h4>风扇控制</h4>
 <p>这一组最需要解释，单独一节。见 <strong>2.3</strong>。</p>
-<h3>2.3 风扇控制</h3>
+<h3>2.3 系统更新（更新 PVE / 更新内核，旧内核可回退）</h3>
+<p>「PVE 工具集」页底部的<strong>系统更新</strong>分区，五个按钮：</p>
+<table>
+<thead>
+<tr>
+<th>按钮</th>
+<th>做什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>检查更新</strong></td>
+<td>联机刷新一次软件源索引，数出可升级的 PVE 包与内核包各多少</td>
+</tr>
+<tr>
+<td><strong>更新 PVE 软件</strong></td>
+<td>升级 PVE 与 Debian 的软件包。<strong>内核一枚都不动</strong></td>
+</tr>
+<tr>
+<td><strong>更新内核</strong></td>
+<td>装上源里最新的内核，并把启动项切到它</td>
+</tr>
+<tr>
+<td><strong>回退到旧内核</strong></td>
+<td>把启动项切回更新前保留的那枚内核</td>
+</tr>
+<tr>
+<td><strong>确认新内核正常，解除保留</strong></td>
+<td>确认没问题后，解除对旧内核的保留</td>
+</tr>
+</tbody>
+</table>
+<h4>回退是怎么保住的</h4>
+<p>点「更新 PVE 软件」或「更新内核」时，<strong>动手前</strong>会自动做一件事：
+把<strong>当前正在运行的那枚内核</strong>用 <code>apt-mark hold</code> 钉住，并记下它的包名。</p>
+<ul>
+<li>「钉住」有两个作用：它不会被顺手升级或卸掉，也就不会被 <code>autoremove</code> 清走。</li>
+<li>这套工具<strong>永不执行 <code>apt autoremove</code>，永不删内核</strong>。</li>
+<li>面板上因此始终显示「保留的旧内核：&lt;版本&gt; 已保留，可回退」。</li>
+</ul>
+<p>更新完、重启进新内核、确认一切正常之后，再点「解除保留」。
+那时若启动项还钉在旧内核上，会<strong>顺手切回最新内核</strong>，避免「解除了保留却还在跑旧的」。</p>
+<blockquote>
+<p>若某一刻发现旧内核被钉得<strong>不完整</strong>（面板会写「保留不完整 (n/m)」），
+说明有个包没钉上，这种状态回退可能失败 —— 面板会明确标出来，不假装没事。</p>
+</blockquote>
+<h4>关于重启</h4>
+<p><strong>这套功能不会自动重启，也不替你重启。</strong> 内核更新必须重启才生效，
+重启由你自己在方便的时候做。</p>
+<blockquote>
+<p><strong>本机就跑在宿主的一台 VM 里时要注意</strong>：重启宿主的瞬间，本机（以及这次会话）
+会随之中断。重启前把基础设施类的 VM/CT 都设成 <code>onboot=1</code>，
+否则宿主起来了、它们还躺着。</p>
+</blockquote>
+<h4>核显 SR-IOV / DKMS 不在本工具处理范围</h4>
+<p>用了核显 SR-IOV（<code>i915-sriov-dkms</code>）这类 DKMS 模块的机器，
+<strong>更新内核后驱动需要为新内核重新编译</strong>。这件事<strong>不在本工具的处理范围内</strong> ——
+本工具只做「更新 PVE、更新内核、保留旧内核可回退」，不代为编译、不代为干预。</p>
+<p>面板上只如实提示这一句。回退仍是有效的退路：切回旧内核 + 重启，
+旧内核上原有的 DKMS 模块照旧可用。</p>
+<h3>2.4 风扇控制</h3>
 <p>面板：<strong>System → PVE 工具集 → 风扇控制</strong>。</p>
 <h4>先理解「控制器」和「风扇名」是两件事</h4>
 <p>主板的 Super I/O 芯片只提供 <strong>pwm 控制器通道</strong>（<code>pwm1</code> / <code>pwm2</code> / <code>pwm3</code> …），
@@ -543,6 +608,34 @@ pve-hwtools-agent fan-scan                        # 看探测缓存
 <td><code>fan-scan</code></td>
 <td>查看探测缓存</td>
 </tr>
+<tr>
+<td><code>upgrade-status</code></td>
+<td>更新状态：当前/已装/可回退内核、可升级包计数</td>
+</tr>
+<tr>
+<td><code>upgrade-check</code></td>
+<td>联机刷新源索引并统计可升级的 PVE / 内核包</td>
+</tr>
+<tr>
+<td><code>upgrade-pve [simulate]</code></td>
+<td>更新 PVE 软件（内核不动）；<code>simulate</code> 只保留+校验、不安装</td>
+</tr>
+<tr>
+<td><code>upgrade-kernel [simulate]</code></td>
+<td>更新内核并保留旧内核</td>
+</tr>
+<tr>
+<td><code>kernel-rollback</code></td>
+<td>把启动项切回保留的旧内核</td>
+</tr>
+<tr>
+<td><code>kernel-release</code></td>
+<td>解除对旧内核的保留</td>
+</tr>
+<tr>
+<td><code>upgrade-progress</code></td>
+<td>查更新任务的进度 JSON</td>
+</tr>
 </tbody>
 </table>
 <h3><code>pve-mirror-switch.sh</code> 全部子命令</h3>
@@ -719,10 +812,13 @@ pve-hwtools-agent fan-rescan 1   # 重扫 + 保留名字与显示设置
 </blockquote>
 <p>旧基线按时间戳存为 <code>fan-baseline.old-&lt;时间戳&gt;</code>，<strong>不删</strong>，万一要回查还在。</p>
 <h3>换内核</h3>
+<p>最省事的做法是<strong>用面板上的「更新内核」</strong>（见 §2.3）：它会自动保留当前内核、
+装上最新的、并把启动项切过去；不合适就点「回退到旧内核」切回来。</p>
 <p><code>pve-hwpatch.sh</code> 本身与内核无关，<code>hwmon</code> 与驱动随内核走，风扇部分无需额外操作。</p>
 <blockquote>
 <p>但<strong>若你用了核显 SR-IOV 之类的 DKMS 模块</strong>，注意 DKMS 只编给被钉选的内核，
-换内核必须同改钉选并重编 DKMS，否则重启仍进旧内核、相关设备全失。</p>
+换内核必须同改钉选并重编 DKMS，否则重启仍进旧内核、相关设备全失。
+<strong>DKMS 的重新编译不在本工具处理范围内</strong>（见 §2.3）。</p>
 </blockquote>
 <h3>修改配置后</h3>
 <p>面板上点「保存并应用」即生效。手工改过 <code>/etc/default/pve-hwtools</code> 后执行：</p>

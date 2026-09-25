@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V2.15
+# 版本：V3.0
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -680,6 +680,176 @@ __PACKAGE__->register_method({
         return { found => ($html ne '' ? 1 : 0), html => ($html // '') };
     },
 });
+__PACKAGE__->register_method({
+    name => 'hwupgradestatus',
+    path => 'hwupgrade-status',
+    method => 'GET',
+    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Audit']] },
+    description => "系统更新状态：当前/已装/可回退内核，可升级包计数，是否有更新在跑。",
+    proxyto => 'node',
+    # protected => 1：要读 /etc/kernel、apt-mark、dpkg 并可能写基线文件，需 root。
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => { node => get_standard_option('pve-node') },
+    },
+    returns => { type => 'object', properties => {} },
+    code => sub {
+        my ($param) = @_;
+        my $out = '';
+        eval {
+            run_command(['/usr/local/bin/pve-hwtools-agent', 'upgrade-status'],
+                        outfunc => sub { $out .= shift },
+                        errfunc => sub { });
+        };
+        my $res = {};
+        eval { $res = decode_json($out) };
+        return $res;
+    },
+});
+__PACKAGE__->register_method({
+    name => 'hwupgradecheck',
+    path => 'hwupgrade-check',
+    method => 'GET',
+    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Audit']] },
+    description => "检查更新（GET 别名）：跑一次 apt update 并统计可升级的 PVE / 内核包。",
+    proxyto => 'node',
+    # protected => 1：apt update 要写 /var/lib/apt（需 root），pveproxy 会降权执行。
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => { node => get_standard_option('pve-node') },
+    },
+    returns => { type => 'object', properties => {} },
+    code => sub {
+        my ($param) = @_;
+        my $out = '';
+        eval {
+            run_command(['/usr/local/bin/pve-hwtools-agent', 'upgrade-check'],
+                        outfunc => sub { $out .= shift },
+                        errfunc => sub { });
+        };
+        my $res = {};
+        eval { $res = decode_json($out) };
+        return $res;
+    },
+});
+__PACKAGE__->register_method({
+    name => 'hwupgradepve',
+    path => 'hwupgrade-pve-get',
+    method => 'GET',
+    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Modify']] },
+    description => "更新 PVE 软件（GET 别名）：只升软件包，内核一枚不动。面板 POST 读不到响应正文。",
+    proxyto => 'node',
+    # protected => 1：apt dist-upgrade 必须 root。
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node     => get_standard_option('pve-node'),
+            simulate => { type => 'boolean', default => 0, optional => 1 },
+        },
+    },
+    returns => { type => 'object', properties => {} },
+    code => sub {
+        my ($param) = @_;
+        my @cmd = ('/usr/local/bin/pve-hwtools-agent', 'upgrade-pve');
+        push @cmd, 'simulate' if $param->{simulate};
+        my $out = '';
+        eval {
+            run_command(\@cmd, outfunc => sub { $out .= shift }, errfunc => sub { });
+        };
+        my $res = {};
+        eval { $res = decode_json($out) };
+        $res->{error} = $@ if ($@ && !$res->{error});
+        return $res;
+    },
+});
+__PACKAGE__->register_method({
+    name => 'hwupgradekernel',
+    path => 'hwupgrade-kernel-get',
+    method => 'GET',
+    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Modify']] },
+    description => "更新内核（GET 别名）：装最新内核并保留旧内核，可一键回退。",
+    proxyto => 'node',
+    # protected => 1：装内核包必须 root。
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node     => get_standard_option('pve-node'),
+            simulate => { type => 'boolean', default => 0, optional => 1 },
+        },
+    },
+    returns => { type => 'object', properties => {} },
+    code => sub {
+        my ($param) = @_;
+        my @cmd = ('/usr/local/bin/pve-hwtools-agent', 'upgrade-kernel');
+        push @cmd, 'simulate' if $param->{simulate};
+        my $out = '';
+        eval {
+            run_command(\@cmd, outfunc => sub { $out .= shift }, errfunc => sub { });
+        };
+        my $res = {};
+        eval { $res = decode_json($out) };
+        $res->{error} = $@ if ($@ && !$res->{error});
+        return $res;
+    },
+});
+__PACKAGE__->register_method({
+    name => 'hwkernelrollback',
+    path => 'hwkernel-rollback-get',
+    method => 'GET',
+    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Modify']] },
+    description => "回退到保留的旧内核（GET 别名）：把启动项指回更新前那枚内核，重启后生效。",
+    proxyto => 'node',
+    # protected => 1：要调 proxmox-boot-tool 改启动项（需 root）。
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => { node => get_standard_option('pve-node') },
+    },
+    returns => { type => 'object', properties => {} },
+    code => sub {
+        my ($param) = @_;
+        my $out = '';
+        eval {
+            run_command(['/usr/local/bin/pve-hwtools-agent', 'kernel-rollback'],
+                        outfunc => sub { $out .= shift }, errfunc => sub { });
+        };
+        my $res = {};
+        eval { $res = decode_json($out) };
+        $res->{error} = $@ if ($@ && !$res->{error});
+        return $res;
+    },
+});
+__PACKAGE__->register_method({
+    name => 'hwkernelrelease',
+    path => 'hwkernel-release-get',
+    method => 'GET',
+    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Modify']] },
+    description => "解除对旧内核的保留（GET 别名）：确认新内核一切正常后使用。",
+    proxyto => 'node',
+    # protected => 1：要调 apt-mark 与 proxmox-boot-tool（需 root）。
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => { node => get_standard_option('pve-node') },
+    },
+    returns => { type => 'object', properties => {} },
+    code => sub {
+        my ($param) = @_;
+        my $out = '';
+        eval {
+            run_command(['/usr/local/bin/pve-hwtools-agent', 'kernel-release'],
+                        outfunc => sub { $out .= shift }, errfunc => sub { });
+        };
+        my $res = {};
+        eval { $res = decode_json($out) };
+        $res->{error} = $@ if ($@ && !$res->{error});
+        return $res;
+    },
+});
 # PVE_HWAPI:END
 '''
 s = s.replace(a2, api, 1)
@@ -1260,6 +1430,51 @@ Ext.define('PVE.node.HwTools', {
                     ],
                 },
                 {
+                    xtype: 'fieldset',
+                    title: gettext('系统更新'),
+                    itemId: 'upgfs',
+                    defaults: { margin: '4 0' },
+                    items: [
+                        {
+                            xtype: 'component',
+                            itemId: 'upghint',
+                            html: '',
+                        },
+                        {
+                            xtype: 'container',
+                            layout: 'hbox',
+                            margin: '6 0 2 0',
+                            items: [
+                                { xtype: 'button', text: gettext('检查更新'),
+                                  iconCls: 'fa fa-search', width: 112,
+                                  handler: function () { me.upgCheck(); } },
+                                { xtype: 'button', text: gettext('更新 PVE 软件'),
+                                  iconCls: 'fa fa-arrow-circle-up', width: 152,
+                                  margin: '0 0 0 8',
+                                  handler: function () { me.upgRun('pve'); } },
+                                { xtype: 'button', text: gettext('更新内核'),
+                                  iconCls: 'fa fa-microchip', width: 122,
+                                  margin: '0 0 0 8',
+                                  handler: function () { me.upgRun('kernel'); } },
+                            ],
+                        },
+                        {
+                            xtype: 'container',
+                            layout: 'hbox',
+                            margin: '2 0 0 0',
+                            items: [
+                                { xtype: 'button', text: gettext('回退到旧内核'),
+                                  iconCls: 'fa fa-undo', width: 152, itemId: 'btrollback',
+                                  handler: function () { me.upgRollback(); } },
+                                { xtype: 'button', text: gettext('确认新内核正常，解除保留'),
+                                  iconCls: 'fa fa-check-circle', width: 236,
+                                  margin: '0 0 0 8', itemId: 'btrelease',
+                                  handler: function () { me.upgRelease(); } },
+                            ],
+                        },
+                    ],
+                },
+                {
                     xtype: 'container',
                     layout: 'hbox',
                     margin: '14 0 0 0',
@@ -1651,6 +1866,216 @@ Ext.define('PVE.node.HwTools', {
             if (crow) { crow.query('numberfield').forEach(function (x) { x.setDisabled(v !== 'auto'); }); }
         },
 
+        // ── 系统更新 ───────────────────────────────────────────────────
+        // 更新区与「保存并应用」互不相干：它直接动宿主包与启动项，不写本页配置。
+        upgRefresh: function () {
+            var me = this;
+            Ext.Ajax.request({
+                url: '/api2/json/nodes/' + me.nodename + '/hwupgrade-status',
+                method: 'GET',
+                success: function (response) {
+                    if (me.destroyed || !me.down) { return; }
+                    var r = {};
+                    try { r = JSON.parse(response.responseText || '{}'); } catch (e) { r = {}; }
+                    me.upgRender((r.data || {}));
+                },
+                failure: function () {
+                    if (me.destroyed || !me.down) { return; }
+                    me.upgRender(null);
+                },
+            });
+        },
+
+        upgRender: function (d) {
+            var me = this;
+            var hint = me.down('#upghint');
+            if (!hint) { return; }
+            var btRoll = me.down('#btrollback');
+            var btRel = me.down('#btrelease');
+            if (!d) {
+                hint.setHtml('<span style="color:#a00">' + gettext('更新状态读取失败。') + '</span>');
+                if (btRoll) { btRoll.setDisabled(true); }
+                if (btRel) { btRel.setDisabled(true); }
+                return;
+            }
+            var fmt = function (ts) {
+                if (!ts) { return ''; }
+                var x = new Date(ts * 1000);
+                var p = function (n) { return (n < 10 ? '0' : '') + n; };
+                return x.getFullYear() + '-' + p(x.getMonth() + 1) + '-' + p(x.getDate()) + ' ' +
+                       p(x.getHours()) + ':' + p(x.getMinutes());
+            };
+            var L = [];
+            L.push(gettext('运行内核：') + '<b>' + (d.running_kernel || '?') + '</b>' +
+                   (d.pinned_kernel ? (gettext('　启动项：') + d.pinned_kernel) : ''));
+            if (d.installed_kernels) {
+                L.push(gettext('已装内核：') + d.installed_kernels);
+            }
+            var held = parseInt(d.fallback_held_n, 10) || 0;
+            var all = parseInt(d.fallback_all_n, 10) || 0;
+            if (d.fallback_kernel) {
+                var okAll = (all > 0 && held === all);
+                var tail = okAll
+                    ? '<span style="color:#080">' + gettext('已保留，可回退') + '</span>'
+                    : '<span style="color:#a60">' + gettext('保留不完整（') + held + '/' + all +
+                      gettext(' 个包仍被钉住），回退可能失败') + '</span>';
+                L.push(gettext('保留的旧内核：') + '<b>' + d.fallback_kernel + '</b>　' + tail +
+                       (d.fallback_ts ? ('　' + gettext('（记录于 ') + fmt(d.fallback_ts) + '）') : ''));
+            } else {
+                L.push('<span style="color:#888">' + gettext('尚未保留旧内核。执行一次「更新 PVE 软件」或「更新内核」时会自动把当前内核保留下来。') + '</span>');
+            }
+            if (d.upgrading) {
+                L.push('<span style="color:#a60">' + gettext('有更新任务正在执行…') + '</span>');
+            } else if (d.upgrade_pve || d.upgrade_kernel) {
+                L.push(gettext('可升级：PVE 软件 ') + d.upgrade_pve + gettext(' 项，内核 ') + d.upgrade_kernel +
+                       gettext(' 项') + (d.kernel_update_available ? gettext('（有内核更新）') : '') +
+                       (d.upgrade_ts ? ('　' + gettext('（检查于 ') + fmt(d.upgrade_ts) + '）') : ''));
+            } else {
+                L.push(d.upgrade_ts
+                    ? (gettext('可升级：无（检查于 ') + fmt(d.upgrade_ts) + '）')
+                    : gettext('点「检查更新」查看可用更新（会联机刷新一次软件源索引）。'));
+            }
+            L.push('<span style="color:#888">' + gettext('更新不会自动重启。内核更新后需自行重启才生效；重启前确认新内核没问题，再点「解除保留」。') + '</span>');
+            L.push('<span style="color:#888">' + gettext('核显 SR-IOV（i915-sriov-dkms）的驱动编译不在本工具处理范围内 —— 更新内核后如需重建，请自行处理。') + '</span>');
+            hint.setHtml(L.join('<br/>'));
+
+            if (btRoll) { btRoll.setDisabled(!d.fallback_kernel || d.upgrading); }
+            if (btRel) { btRel.setDisabled(!d.fallback_kernel || d.upgrading); }
+        },
+
+        upgCheck: function () {
+            var me = this;
+            me.setLoading(gettext('正在检查更新…'));
+            Ext.Ajax.request({
+                url: '/api2/json/nodes/' + me.nodename + '/hwupgrade-check',
+                method: 'GET',
+                timeout: 180000,
+                success: function (response) {
+                    me.setLoading(false);
+                    if (me.destroyed || !me.down) { return; }
+                    var r = {};
+                    try { r = JSON.parse(response.responseText || '{}'); } catch (e) { r = {}; }
+                    var d = r.data || {};
+                    if (d.ok === false) {
+                        Ext.Msg.alert(gettext('检查失败'), gettext('软件源索引刷新失败（退出码 ') + d.rc + gettext('）。详见宿主上的日志。'));
+                    } else {
+                        Ext.Msg.alert(gettext('检查完成'),
+                            gettext('可升级：PVE 软件 ') + d.pve + gettext(' 项，内核 ') + d.kernel + gettext(' 项。'));
+                    }
+                    me.upgRefresh();
+                },
+                failure: function (response) {
+                    me.setLoading(false);
+                    Ext.Msg.alert(gettext('检查失败'), response.htmlStatus);
+                },
+            });
+        },
+
+        upgRun: function (what) {
+            var me = this;
+            var isPve = (what === 'pve');
+            var title = isPve ? gettext('更新 PVE 软件') : gettext('更新内核');
+            var body = isPve
+                ? gettext('将更新 PVE 与 Debian 的软件包（<b>内核一枚都不动</b>）。<br/><br/>动手前会自动把<b>当前内核</b>保留下来（apt-mark hold），万一更新失败可一键回退。不会自动重启。<br/><br/>继续？')
+                : gettext('将安装最新内核，并<b>保留当前内核</b>以便回退。装好后启动项会切到新内核，但<b>需自行重启才生效</b>。不会自动重启。<br/><br/>继续？');
+            Ext.Msg.confirm(title, body, function (btn) {
+                if (btn !== 'yes') { return; }
+                me.setLoading(isPve ? gettext('正在更新 PVE 软件…') : gettext('正在更新内核…'));
+                var url = '/api2/json/nodes/' + me.nodename + (isPve ? '/hwupgrade-pve-get' : '/hwupgrade-kernel-get');
+                Ext.Ajax.request({
+                    url: url,
+                    method: 'GET',
+                    timeout: 1800000,
+                    success: function (response) {
+                        var r = {};
+                        try { r = JSON.parse(response.responseText || '{}'); } catch (e) { r = {}; }
+                        var d = r.data || {};
+                        me.setLoading(false);
+                        if (me.destroyed || !me.down) { return; }
+                        var msg = d.msg || '';
+                        if (!d.ok) {
+                            Ext.Msg.alert(title + gettext(' 未成功'), msg || gettext('详见宿主日志。'));
+                        } else {
+                            var extra = '';
+                            if (!isPve && d.reboot_needed) {
+                                extra = '<br/><br/>' + gettext('重启后才会用上新内核。重启前若发现问题，可点「回退到旧内核」。');
+                            }
+                            Ext.Msg.alert(title + gettext(' 完成'), msg + extra);
+                        }
+                        me.upgRefresh();
+                    },
+                    failure: function (response) {
+                        me.setLoading(false);
+                        Ext.Msg.alert(title + gettext(' 失败'), response.htmlStatus);
+                    },
+                });
+            });
+        },
+
+        upgRollback: function () {
+            var me = this;
+            Ext.Msg.confirm(gettext('回退到旧内核'),
+                gettext('将把启动项切回更新前保留的那枚内核。<b>需要重启才生效</b>，重启后这台主机会运行旧内核。<br/><br/>继续？'),
+                function (btn) {
+                    if (btn !== 'yes') { return; }
+                    me.setLoading(gettext('正在切换启动内核…'));
+                    Ext.Ajax.request({
+                        url: '/api2/json/nodes/' + me.nodename + '/hwkernel-rollback-get',
+                        method: 'GET',
+                        timeout: 180000,
+                        success: function (response) {
+                            me.setLoading(false);
+                            if (me.destroyed || !me.down) { return; }
+                            var r = {};
+                            try { r = JSON.parse(response.responseText || '{}'); } catch (e) { r = {}; }
+                            var d = r.data || {};
+                            if (!d.ok) {
+                                Ext.Msg.alert(gettext('回退失败'), d.msg || gettext('详见宿主日志。'));
+                            } else {
+                                me.reload();
+                                Ext.Msg.alert(gettext('已切换启动内核'), d.msg);
+                            }
+                        },
+                        failure: function (response) {
+                            me.setLoading(false);
+                            Ext.Msg.alert(gettext('回退失败'), response.htmlStatus);
+                        },
+                    });
+                });
+        },
+
+        upgRelease: function () {
+            var me = this;
+            Ext.Msg.confirm(gettext('解除旧内核保留'),
+                gettext('确认新内核一切正常后再做这一步。解除后旧内核不再被钉住（仍留在启动菜单里），今后清理内核时可能被移除。<br/><br/>继续？'),
+                function (btn) {
+                    if (btn !== 'yes') { return; }
+                    me.setLoading(gettext('正在解除保留…'));
+                    Ext.Ajax.request({
+                        url: '/api2/json/nodes/' + me.nodename + '/hwkernel-release-get',
+                        method: 'GET',
+                        timeout: 180000,
+                        success: function (response) {
+                            me.setLoading(false);
+                            if (me.destroyed || !me.down) { return; }
+                            var r = {};
+                            try { r = JSON.parse(response.responseText || '{}'); } catch (e) { r = {}; }
+                            var d = r.data || {};
+                            if (!d.ok) {
+                                Ext.Msg.alert(gettext('解除失败'), d.msg || gettext('详见宿主日志。'));
+                            } else {
+                                me.upgRefresh();
+                                Ext.Msg.alert(gettext('已解除保留'), d.msg);
+                            }
+                        },
+                        failure: function (response) {
+                            me.setLoading(false);
+                            Ext.Msg.alert(gettext('解除失败'), response.htmlStatus);
+                        },
+                    });
+                });
+        },
+
     reload: function () {
         var me = this;
         Proxmox.Utils.API2Request({
@@ -1693,6 +2118,9 @@ Ext.define('PVE.node.HwTools', {
 
                 // 风扇通道与温度源都来自本机实测，控件只能在此动态创建
                 me.buildFanRows(d);
+
+                // 更新区：另走 hwupgrade-status（读内核/apt 状态），随每次载入刷新
+                me.upgRefresh();
 
                 // 数字框的合法范围也须在 setValues 之前设好，否则被当作越界而清空。
                 // 单位一律 MHz（状态接口已折算好）。
@@ -1877,7 +2305,7 @@ if _src:
                      % _blk[max(0, _m.start()-50):_m.start()+50].replace("\n", " / "))
 
 # 概要面板高度基线
-s = re.sub(r"(alias: 'widget\.pveNodeStatus',\n\n    height: )\d+(,)", r"\g<1>480\g<2>", s, count=1)
+s = re.sub(r"(alias: 'widget\.pveNodeStatus',<br/><br/>    height: )\d+(,)", r"\g<1>480\g<2>", s, count=1)
 
 # 注意：**不能**因为 s == orig 就报错。已打过补丁的文件再跑一遍时，
 # 「移除旧块 + 重新注入」恰好等于原文，s == orig 是正常结果；若判为失败并回滚，

@@ -1,5 +1,5 @@
 #!/bin/bash
-# pve-hwtools-agent —— PVE 工具集状态代理（V2.15）
+# pve-hwtools-agent —— PVE 工具集状态代理（V3.0）
 #
 # 唯一的配置真相：/etc/default/pve-hwtools
 # 职责：读/写该配置；施加 CPU 调频；按配置触发界面重渲染。
@@ -1266,6 +1266,437 @@ cmd_apply() {
   emit_status
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 系统更新：更新 PVE 软件 / 更新内核 —— 保留旧内核，更新失败可回退
+#
+# 安全设计（动的是宿主升级，守得比普通补丁严）：
+#   * 只在用户明确点按对应按钮/命令时才动作，绝不自作主张，绝不自动重启。
+#   * 动手前先把**当前运行内核**apt-mark hold 住：既防它被顺手卸掉，
+#     也保证它留在启动菜单里 —— 这就是「回退的退路」。
+#   * 永不执行 apt autoremove，永不删内核。
+#   * 全程留痕 $UPGRADE_LOG。
+#   * 核显 SR-IOV 的 DKMS 是否随新内核重建，**不在本工具处理范围**：
+#     界面只如实提示，不代为编译、不代为干预。
+# ═══════════════════════════════════════════════════════════════════════════
+UPGRADE_PROG=/run/pve-hwtools-upgrade.json
+UPGRADE_LOG=/var/log/pve-hwtools-upgrade.log
+FALLBACK_CONF=/usr/local/lib/pve-hwtools/kernel-fallback.conf
+UPGRADE_CACHE=/usr/local/lib/pve-hwtools/upgrade-cache.json
+
+upg_prog() {   # $1=state $2=step $3=pct [$4=result JSON]
+  printf '{"state":"%s","step":"%s","pct":%s,"ts":%s,"result":%s}\n' \
+    "$1" "$2" "$3" "$(date +%s)" "${4:-null}" > "$UPGRADE_PROG" 2>/dev/null
+  return 0
+}
+upg_log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$UPGRADE_LOG" 2>/dev/null; return 0; }
+
+# 已装内核版本，新→旧。只认「发行版号-pve」形态；series 元包 / headers / dbg 都不算。
+kernels_installed() {
+  dpkg -l 2>/dev/null \
+    | awk '/^[ih]/{print $2}' \
+    | grep -E '^(proxmox|pve)-kernel-[0-9]' \
+    | grep -vE -- '-dbg$|-dbgsym$|-template$|-headers$' \
+    | sed -e 's#^pve-kernel-##' -e 's#^proxmox-kernel-##' -e 's#-signed$##' \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-pve$' \
+    | sort -u -V -r
+  return 0
+}
+
+# 某个内核版本对应的**已装**包名（同一版常并存 signed 与非 signed 两个包）
+kernel_pkgs_for() {   # $1=7.0.14-19-pve
+  local v="$1" p
+  for p in "proxmox-kernel-$v" "proxmox-kernel-$v-signed" "pve-kernel-$v" "pve-kernel-$v-signed"; do
+    if dpkg-query -W -f='${db:Status-Status}' "$p" 2>/dev/null | grep -q '^installed$'; then
+      printf '%s\n' "$p"
+    fi
+  done
+  return 0
+}
+
+kernel_series() { printf '%s' "$1" | sed -E 's/^([0-9]+\.[0-9]+)\..*/\1/'; }
+
+# 源里最新的内核版本（不带前缀）；取不到就输出空
+#   必须用 pkgnames + 严格 grep：`apt-cache search --names-only '...pve$'` 的 $ 锚
+#   并不生效，`proxmox-kernel-6.14.11-1-pve-signed` 也会被匹配进来（实测 145 行里
+#   混着大量 -signed），于是「源里最新」变成带后缀的怪值、还会误报「有内核更新」。
+kernel_avail_newest() {
+  apt-cache pkgnames proxmox-kernel- 2>/dev/null \
+    | grep -E '^proxmox-kernel-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-pve(-signed)?$' \
+    | sed -e 's/^proxmox-kernel-//' -e 's/-signed$//' \
+    | sort -u -V | tail -1
+  return 0
+}
+
+# ── 回退基线（持久，跨重启保留）──
+fallback_load() {
+  FALLBACK_KERNEL=""; FALLBACK_PKGS=""; FALLBACK_TS=0
+  [ -r "$FALLBACK_CONF" ] || return 0
+  . "$FALLBACK_CONF"
+  return 0
+}
+fallback_save() {   # $1=内核版本 $2=包名逗号分隔
+  mkdir -p "$(dirname "$FALLBACK_CONF")" 2>/dev/null
+  {
+    printf '# PVE 工具集：更新前的内核回退基线（面板写入，勿手改）\n'
+    printf 'FALLBACK_KERNEL=%s\n' "$1"
+    printf 'FALLBACK_PKGS=%s\n' "$2"
+    printf 'FALLBACK_TS=%s\n' "$(date +%s)"
+  } > "$FALLBACK_CONF"
+  chmod 644 "$FALLBACK_CONF" 2>/dev/null
+  return 0
+}
+
+kernel_hold() {   # $1=内核版本：把它全部已装包钉住
+  local plist
+  plist=$(kernel_pkgs_for "$1" | tr '\n' ' ')
+  [ -n "${plist// /}" ] || return 1
+  apt-mark hold $plist >>"$UPGRADE_LOG" 2>&1
+  return $?
+}
+kernel_unhold() {
+  local plist
+  plist=$(kernel_pkgs_for "$1" | tr '\n' ' ')
+  [ -n "${plist// /}" ] || return 1
+  apt-mark unhold $plist >>"$UPGRADE_LOG" 2>&1
+  return $?
+}
+
+# 记录并钉住「当前运行内核」= 回退的退路
+protect_running_kernel() {
+  local k pkgs
+  k=$(uname -r)
+  pkgs=$(kernel_pkgs_for "$k" | tr '\n' ',' | sed 's/,$//')
+  if [ -z "$pkgs" ]; then
+    upg_log "未能保留运行内核 $k：找不到对应的已装包"
+    return 1
+  fi
+  if kernel_hold "$k"; then
+    fallback_save "$k" "$pkgs"
+    upg_log "已保留运行内核 $k（保留包：$pkgs），必要时可回退"
+    return 0
+  fi
+  upg_log "保留运行内核 $k 失败（apt-mark hold 返回非零）"
+  return 1
+}
+
+upg_busy() {   # 有没有正在跑的更新任务（超过 30 分钟视为僵尸）
+  [ -r "$UPGRADE_PROG" ] || return 1
+  local st ts now
+  st=$(sed -n 's/.*"state":"\([a-z]*\)".*/\1/p' "$UPGRADE_PROG" 2>/dev/null | head -1)
+  ts=$(sed -n 's/.*"ts":\([0-9]*\).*/\1/p' "$UPGRADE_PROG" 2>/dev/null | head -1)
+  [ "${st:-}" = running ] || return 1
+  [ -n "${ts:-}" ] || return 1
+  now=$(date +%s)
+  [ "$((now - ts))" -lt 1800 ] && return 0
+  return 1
+}
+
+# 用已有 apt 缓存扫可升级清单（不联网）
+upg_scan() {
+  UP_N_PVE=0; UP_N_KERNEL=0; UP_LIST_PVE=""; UP_LIST_KERNEL=""
+  local k
+  for k in $(apt-get -s -y dist-upgrade 2>/dev/null | awk '/^Inst /{print $2}'); do
+    case "$k" in
+      pve-kernel-*|proxmox-kernel-*)
+        UP_N_KERNEL=$((UP_N_KERNEL+1)); UP_LIST_KERNEL="$UP_LIST_KERNEL$k," ;;
+      pve-*|proxmox-*|libpve-*|qemu-server|lxc-pve|corosync|zfsutils-linux|swtpm|ceph-*)
+        UP_N_PVE=$((UP_N_PVE+1)); UP_LIST_PVE="$UP_LIST_PVE$k," ;;
+    esac
+  done
+  UP_LIST_PVE="${UP_LIST_PVE%,}"; UP_LIST_KERNEL="${UP_LIST_KERNEL%,}"
+  return 0
+}
+upg_cache_write() {
+  mkdir -p "$(dirname "$UPGRADE_CACHE")" 2>/dev/null
+  printf '{"ts":%s,"pve":%s,"kernel":%s,"pve_list":"%s","kernel_list":"%s"}\n' \
+    "$(date +%s)" "$UP_N_PVE" "$UP_N_KERNEL" "$UP_LIST_PVE" "$UP_LIST_KERNEL" > "$UPGRADE_CACHE" 2>/dev/null
+  return 0
+}
+
+cmd_upgrade_status() {
+  need_root
+  local run pinned inst newest avail
+  run=$(uname -r)
+  inst=$(kernels_installed | tr '\n' ',' | sed 's/,$//')
+  newest=$(kernels_installed | head -1)
+  pinned=$(cat /etc/kernel/proxmox-boot-pin 2>/dev/null || true)
+  avail=$(kernel_avail_newest)
+  fallback_load
+  # 回退内核对：有几枚还钉着（钉着才谈得上「保得住」）
+  local held=0 all=0 p holds savesep
+  holds=$(apt-mark showhold 2>/dev/null)
+  savesep="$IFS"; IFS=','
+  for p in $FALLBACK_PKGS; do
+    [ -n "$p" ] || continue
+    all=$((all+1))
+    printf '%s\n' "$holds" | grep -qxF "$p" && held=$((held+1))
+  done
+  IFS="$savesep"
+  # 缓存里的可升级计数
+  local upg_pve=0 upg_kernel=0 cache_ts=0
+  if [ -r "$UPGRADE_CACHE" ]; then
+    cache_ts=$(sed -n 's/.*"ts":\([0-9]*\).*/\1/p' "$UPGRADE_CACHE" 2>/dev/null | head -1)
+    upg_pve=$(sed -n 's/.*"pve":\([0-9]*\).*/\1/p' "$UPGRADE_CACHE" 2>/dev/null | head -1)
+    upg_kernel=$(sed -n 's/.*"kernel":\([0-9]*\).*/\1/p' "$UPGRADE_CACHE" 2>/dev/null | head -1)
+  fi
+  local busy=false kupd=false
+  upg_busy && busy=true
+  if [ -n "$avail" ] && [ "$avail" != "${newest:-}" ]; then
+    [ "$(printf '%s\n%s\n' "${newest:-}" "$avail" | sort -V | tail -1)" = "$avail" ] && kupd=true
+  fi
+  printf '{"running_kernel":"%s","installed_kernels":"%s","newest_installed":"%s","pinned_kernel":"%s","avail_newest":"%s","fallback_kernel":"%s","fallback_pkgs":"%s","fallback_ts":%s,"fallback_held_n":%s,"fallback_all_n":%s,"upgrade_ts":%s,"upgrade_pve":%s,"upgrade_kernel":%s,"upgrading":%s,"kernel_update_available":%s,"log_file":"%s"}\n' \
+    "$run" "$inst" "${newest:-}" "${pinned:-}" "${avail:-}" "${FALLBACK_KERNEL:-}" "${FALLBACK_PKGS:-}" \
+    "${FALLBACK_TS:-0}" "$held" "$all" "${cache_ts:-0}" "${upg_pve:-0}" "${upg_kernel:-0}" "$busy" "$kupd" "$UPGRADE_LOG"
+  return 0
+}
+
+cmd_upgrade_check() {
+  need_root
+  upg_log "=== 检查更新 ==="
+  local rc=0
+  apt-get update >>"$UPGRADE_LOG" 2>&1 || rc=$?
+  upg_scan
+  upg_cache_write
+  local ok=false; [ "$rc" -eq 0 ] && ok=true
+  printf '{"ok":%s,"rc":%s,"pve":%s,"kernel":%s,"pve_list":"%s","kernel_list":"%s","ts":%s}\n' \
+    "$ok" "$rc" "$UP_N_PVE" "$UP_N_KERNEL" "$UP_LIST_PVE" "$UP_LIST_KERNEL" "$(date +%s)"
+  return 0
+}
+
+# ── 更新 PVE 软件：只升软件，内核一枚不动 ──
+cmd_upgrade_pve() {
+  need_root
+  local sim=false; [ "${1:-}" = simulate ] && sim=true
+  if upg_busy; then printf '{"ok":false,"msg":"已有更新任务在执行中"}\n'; return 0; fi
+  upg_log "=== 更新 PVE 软件 开始（simulate=$sim）==="
+  upg_prog running "保留当前内核…" 5
+  local fb_ok=true
+  protect_running_kernel || fb_ok=false
+
+  upg_prog running "更新软件包索引…" 15
+  if [ "$sim" = false ]; then
+    if ! apt-get update >>"$UPGRADE_LOG" 2>&1; then
+      upg_log "apt-get update 失败"
+      upg_prog error "更新软件包索引失败" 100
+      printf '{"ok":false,"msg":"更新软件包索引失败，详见 %s"}\n' "$UPGRADE_LOG"
+      return 0
+    fi
+  fi
+
+  # 临时 hold 住全部内核包（版本包 + series 元包）：本次只升软件
+  local k p metas tmphold=""
+  for k in $(kernels_installed); do
+    p=$(kernel_pkgs_for "$k" | tr '\n' ' ')
+    tmphold="$tmphold $p"
+  done
+  metas=$(dpkg-query -W -f='${Package}\n' 'proxmox-kernel-*' 'pve-kernel-*' 'proxmox-default-kernel' 2>/dev/null \
+          | grep -E '^(proxmox|pve)-kernel-[0-9]+\.[0-9]+$|^proxmox-default-kernel$')
+  tmphold=$(printf '%s %s' "$tmphold" "$(printf '%s' "$metas" | tr '\n' ' ')" | tr -s ' ' | sed 's/^ //; s/ $//')
+  if [ -n "${tmphold// /}" ]; then
+    upg_log "临时保留内核包：$tmphold"
+    apt-mark hold $tmphold >>"$UPGRADE_LOG" 2>&1
+  fi
+
+  upg_prog running "校验升级可行性…" 25
+  local simout; simout=$(apt-get -s -y dist-upgrade 2>&1)
+  if printf '%s\n' "$simout" | grep -q '^E:'; then
+    [ -n "${tmphold// /}" ] && apt-mark unhold $tmphold >>"$UPGRADE_LOG" 2>&1
+    [ "$fb_ok" = true ] && kernel_hold "$(uname -r)" >/dev/null 2>&1
+    upg_log "校验未通过：$(printf '%s\n' "$simout" | grep '^E:' | head -3 | tr '\n' ';')"
+    upg_prog error "升级校验未通过（保留内核导致依赖冲突），已中止且未做任何改动" 100
+    printf '{"ok":false,"msg":"升级校验未通过，已中止且未做任何改动；详见 %s"}\n' "$UPGRADE_LOG"
+    return 0
+  fi
+  local n_up n_rm before_pve before_kernels rc=0
+  n_up=$(printf '%s\n' "$simout" | grep -c '^Inst ')
+  n_rm=$(printf '%s\n' "$simout" | grep -c '^Remv ')
+  before_pve=$(dpkg-query -W -f='${Version}' pve-manager 2>/dev/null || printf '?')
+  before_kernels=$(kernels_installed | tr '\n' ',' | sed 's/,$//')
+
+  if [ "$sim" = true ]; then
+    upg_prog running "（模拟模式）不实际安装" 90
+  else
+    upg_prog running "下载并安装 $n_up 个包…" 40
+    DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confold dist-upgrade >>"$UPGRADE_LOG" 2>&1
+    rc=$?
+  fi
+
+  # 收尾：解除临时 hold，再把运行内核重新钉回去（回退退路始终在）
+  [ -n "${tmphold// /}" ] && apt-mark unhold $tmphold >>"$UPGRADE_LOG" 2>&1
+  protect_running_kernel >/dev/null 2>&1
+
+  local after_pve after_kernels newk=false
+  after_pve=$(dpkg-query -W -f='${Version}' pve-manager 2>/dev/null || printf '?')
+  after_kernels=$(kernels_installed | tr '\n' ',' | sed 's/,$//')
+  [ "$before_kernels" != "$after_kernels" ] && newk=true
+  upg_scan; upg_cache_write
+
+  local msg
+  if [ "$rc" -ne 0 ]; then
+    msg="更新过程中出错（退出码 $rc），已停下；运行内核与回退内核都还在"
+    upg_log "$msg"
+    upg_prog error "$msg" 100
+  elif [ "$sim" = true ]; then
+    msg="模拟完成：将更新 $n_up 个包、移除 $n_rm 个；未做任何实际改动"
+    upg_prog done "$msg" 100
+  else
+    msg="更新完成：处理 $n_up 个包"
+    [ "$after_pve" != "$before_pve" ] && msg="$msg；PVE 面板 $before_pve → $after_pve"
+    [ "$newk" = true ] && msg="$msg；顺带装入了新内核（未切换运行内核）"
+    msg="$msg。运行内核仍是 $(uname -r)"
+    upg_prog done "$msg" 100
+  fi
+  upg_log "结果：$msg"
+  printf '{"ok":%s,"rc":%s,"packages":%s,"removed":%s,"pve_before":"%s","pve_after":"%s","new_kernel":%s,"msg":"%s"}\n' \
+    "$([ "$rc" -eq 0 ] && echo true || echo false)" "$rc" "$n_up" "$n_rm" "$before_pve" "$after_pve" "$newk" "$(printf '%s' "$msg" | sed 's/"/\\"/g')"
+  return 0
+}
+
+# ── 更新内核：装最新内核，旧内核保留不回退 ──
+cmd_upgrade_kernel() {
+  need_root
+  local sim=false; [ "${1:-}" = simulate ] && sim=true
+  if upg_busy; then printf '{"ok":false,"msg":"已有更新任务在执行中"}\n'; return 0; fi
+  upg_log "=== 更新内核 开始（simulate=$sim）==="
+  upg_prog running "保留当前内核…" 5
+  local fb_ok=true
+  protect_running_kernel || fb_ok=false
+  fallback_load
+  local oldk="${FALLBACK_KERNEL:-$(uname -r)}"
+
+  upg_prog running "更新软件包索引…" 15
+  if [ "$sim" = false ]; then
+    if ! apt-get update >>"$UPGRADE_LOG" 2>&1; then
+      upg_prog error "更新软件包索引失败" 100
+      printf '{"ok":false,"msg":"更新软件包索引失败，详见 %s"}\n' "$UPGRADE_LOG"
+      return 0
+    fi
+  fi
+
+  # 让 series 元包能升级（不然元包被 hold 就拉不动新内核）；版本包（含旧内核）继续保留
+  local m
+  for m in $(apt-mark showhold 2>/dev/null | grep -E '^(proxmox|pve)-kernel-[0-9]+\.[0-9]+$'); do
+    apt-mark unhold "$m" >>"$UPGRADE_LOG" 2>&1 || true
+  done
+
+  upg_prog running "确定最新内核…" 25
+  local cand series target run
+  run=$(uname -r)
+  cand=$(kernel_avail_newest)
+  if [ -z "$cand" ]; then
+    upg_prog error "源里查不到可用内核版本" 100
+    printf '{"ok":false,"msg":"源里查不到可用内核版本，请先检查软件源"}\n'
+    return 0
+  fi
+  series=$(kernel_series "$cand")
+  target="proxmox-kernel-$series"
+  apt-cache show "$target" >/dev/null 2>&1 || target="proxmox-kernel-$cand"
+
+  if [ "$cand" = "$run" ] && kernels_installed | grep -qxF "$cand"; then
+    upg_prog done "已是最新内核 $cand（运行中）" 100
+    printf '{"ok":true,"up_to_date":true,"kernel":"%s","msg":"已是最新内核，无需更新"}\n' "$cand"
+    return 0
+  fi
+
+  local rc=0 before_kernels
+  before_kernels=$(kernels_installed | tr '\n' ',' | sed 's/,$//')
+  if [ "$sim" = true ]; then
+    upg_prog running "（模拟模式）不实际安装" 90
+  else
+    upg_prog running "安装 $target …" 40
+    DEBIAN_FRONTEND=noninteractive apt-get -y install "$target" >>"$UPGRADE_LOG" 2>&1
+    rc=$?
+  fi
+
+  # 旧内核始终钉回去（回退退路）
+  [ "$fb_ok" = true ] && kernel_hold "$oldk" >/dev/null 2>&1
+
+  local newest newk=false after_kernels
+  newest=$(kernels_installed | head -1)
+  after_kernels=$(kernels_installed | tr '\n' ',' | sed 's/,$//')
+  [ "$before_kernels" != "$after_kernels" ] && newk=true
+
+  local pinned_msg=""
+  if [ "$rc" -eq 0 ] && [ "$sim" = false ] && [ "$newk" = true ]; then
+    # 装成功了就把启动项指到新内核（否则重启还是旧内核，「更新内核」等于没做）
+    if command -v proxmox-boot-tool >/dev/null 2>&1 && proxmox-boot-tool kernel pin "$newest" >>"$UPGRADE_LOG" 2>&1; then
+      pinned_msg="；下次启动将使用新内核"
+      upg_log "已把启动内核钉到 $newest"
+    else
+      pinned_msg="；但启动项自动切换失败，可在启动菜单里手选"
+    fi
+  fi
+
+  local msg
+  if [ "$rc" -ne 0 ]; then
+    msg="内核安装出错（退出码 $rc），已停下；运行内核与回退内核都还在"
+    upg_prog error "$msg" 100
+  elif [ "$newk" = false ]; then
+    msg="内核无变化（已是最新）"
+    upg_prog done "$msg" 100
+  else
+    msg="内核已更新：$oldk → $newest$pinned_msg。旧内核 $oldk 已保留，可一键回退"
+    upg_prog done "$msg" 100
+  fi
+  upg_log "结果：$msg"
+  printf '{"ok":%s,"rc":%s,"old_kernel":"%s","new_kernel":"%s","installed":"%s","reboot_needed":%s,"fallback":"%s","msg":"%s"}\n' \
+    "$([ "$rc" -eq 0 ] && echo true || echo false)" "$rc" "$oldk" "${newest:-}" "$after_kernels" \
+    "$([ "$newk" = true ] && echo true || echo false)" "$oldk" "$(printf '%s' "$msg" | sed 's/"/\\"/g')"
+  return 0
+}
+
+# ── 回退到保留的旧内核 ──
+cmd_kernel_rollback() {
+  need_root
+  fallback_load
+  if [ -z "${FALLBACK_KERNEL:-}" ]; then
+    printf '{"ok":false,"msg":"没有记录到可回退的旧内核（需先执行过一次更新）"}\n'
+    return 0
+  fi
+  if ! kernels_installed | grep -qxF "$FALLBACK_KERNEL"; then
+    printf '{"ok":false,"msg":"回退目标 %s 已不在本机，无法回退"}\n' "$FALLBACK_KERNEL"
+    return 0
+  fi
+  kernel_hold "$FALLBACK_KERNEL" >/dev/null 2>&1
+  if ! command -v proxmox-boot-tool >/dev/null 2>&1; then
+    printf '{"ok":false,"msg":"本机没有 proxmox-boot-tool，无法自动切换启动内核"}\n'
+    return 0
+  fi
+  if proxmox-boot-tool kernel pin "$FALLBACK_KERNEL" >>"$UPGRADE_LOG" 2>&1; then
+    upg_log "已把启动内核钉到 $FALLBACK_KERNEL"
+    printf '{"ok":true,"kernel":"%s","msg":"启动内核已设为 %s，重启后生效。"}\n' "$FALLBACK_KERNEL" "$FALLBACK_KERNEL"
+    return 0
+  fi
+  printf '{"ok":false,"msg":"切换启动内核失败，详见 %s"}\n' "$UPGRADE_LOG"
+  return 0
+}
+
+# ── 确认新内核正常，解除对旧内核的保留 ──
+cmd_kernel_release() {
+  need_root
+  fallback_load
+  if [ -z "${FALLBACK_KERNEL:-}" ]; then
+    printf '{"ok":false,"msg":"当前没有处于保留状态的旧内核"}\n'
+    return 0
+  fi
+  local k="$FALLBACK_KERNEL"
+  kernel_unhold "$k" >/dev/null 2>&1
+  # 启动项还钉在旧内核上就顺手切回最新内核，避免「解除了保留却还在跑旧的」
+  local newest; newest=$(kernels_installed | head -1)
+  local note=""
+  if [ -n "$newest" ] && [ "$newest" != "$k" ]; then
+    if proxmox-boot-tool kernel pin "$newest" >>"$UPGRADE_LOG" 2>&1; then
+      note="；启动内核已切回 $newest"
+    fi
+  fi
+  rm -f "$FALLBACK_CONF"
+  upg_log "已解除对 $k 的保留$note"
+  printf '{"ok":true,"released":"%s","msg":"已解除对 %s 的保留%s。该内核仍留在启动菜单，只是不再被钉住。"}\n' \
+    "$k" "$k" "$note"
+  return 0
+}
+
+
 case "${1:-status}" in
   status) cmd_status ;;
   set) shift; cmd_set "$@" ;;
@@ -1277,5 +1708,12 @@ case "${1:-status}" in
     fan-bind-progress) cat /run/pve-hwtools-fanbind.json 2>/dev/null || printf '{"state":"idle"}\n' ;;
     fan-rescan) shift; cmd_fan_rescan "${1:-0}" ;;
     fan-scan)   cat "$FAN_REGISTRY" 2>/dev/null || printf 'SCAN_HWID=(未探测)\n' ;;
-    *) die "用法：pve-hwtools-agent {status|set k=v...|apply|mirrors|fan-test N|fan-detect|fan-bind|fan-bind-progress|fan-rescan [keep=0/1]|fan-scan}" ;;
+  upgrade-status)    cmd_upgrade_status ;;
+  upgrade-check)     cmd_upgrade_check ;;
+  upgrade-pve)       shift; cmd_upgrade_pve "${1:-}" ;;
+  upgrade-kernel)    shift; cmd_upgrade_kernel "${1:-}" ;;
+  kernel-rollback)   cmd_kernel_rollback ;;
+  kernel-release)    cmd_kernel_release ;;
+  upgrade-progress)  cat "$UPGRADE_PROG" 2>/dev/null || printf '{"state":"idle"}\n' ;;
+    *) die "用法：pve-hwtools-agent {status|set k=v...|apply|mirrors|fan-test N|fan-detect|fan-bind|fan-bind-progress|fan-rescan [keep=0/1]|fan-scan|upgrade-status|upgrade-check|upgrade-pve [simulate]|upgrade-kernel [simulate]|kernel-rollback|kernel-release|upgrade-progress}" ;;
 esac
