@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V2.4
+# 版本：V2.7
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -268,10 +268,10 @@ else
 fi
 
 # ---------- 1) 传感器取样脚本（纯 ASCII 数值与名称）----------
-if [ ! -f "$SH" ] || ! grep -q "$MARK-v8" "$SH" 2>/dev/null; then
+if [ ! -f "$SH" ] || ! grep -q "$MARK-v10" "$SH" 2>/dev/null; then
   cat > "$SH" <<'EOS'
 #!/bin/bash
-# PVE_HWPATCH-v8 —— 输出节点硬件概要 JSON（单行，纯 ASCII 数值与名称，单位由前端补）
+# PVE_HWPATCH-v10 —— 输出节点硬件概要 JSON（单行，纯 ASCII 数值与名称，单位由前端补）
 je(){ printf '%s' "$1" | LC_ALL=C sed 's/\\/\\\\/g; s/"/\\"/g; s/[^ -~]//g'; }
 command -v sensors >/dev/null 2>&1 || { echo '{}'; exit 0; }
 S=$(sensors 2>/dev/null)
@@ -285,8 +285,42 @@ CORES=$(printf '%s\n' "$S" | awk '/^Core [0-9]+:/{n=$1" "$2; sub(/:$/,"",n); v=$
 BOARD=$(printf '%s\n' "$S" | awk '/CPUTIN/{print $2; exit}' | tr -d '+C')
 [ -z "$BOARD" ] && BOARD=$(printf '%s\n' "$S" | awk '/SYSTIN/{print $2; exit}' | tr -d '+C')
 
-# 风扇：带序号（fan1:1106,fan2:1407）
-FANS=$(printf '%s\n' "$S" | awk '/^fan[0-9]+:/{n=$1; sub(/:$/,"",n); if($2+0>0) printf "%s:%s,", n, $2}' | sed 's/,$//')
+# 风扇：带序号、名字、显示策略（每行 fanN:rpm:label，label 是百分号编码的名字）
+#   为何每行一条：名字里可能有空格，用空格或逗号分隔都会被拆碎。
+#   为何百分号编码：Perl 反引号读 UTF-8 会二次编码变乱码；编码成纯 ASCII 后，
+#   前端 decodeURIComponent 就能完整还原中文。
+FANS=""
+if [ -r /etc/default/pve-hwtools ]; then
+  . /etc/default/pve-hwtools 2>/dev/null || true
+  HWM=""
+  for _h in /sys/class/hwmon/hwmon*; do
+    case "$(cat $_h/name 2>/dev/null)" in
+      nct6775|nct6776|nct6779|nct6791|nct6792|nct6793|nct6795|nct6796|nct6797|nct6798)
+        HWM=$_h ;;
+    esac
+  done
+  if [ -n "$HWM" ]; then
+    for _f in "$HWM"/fan[0-9]*_input; do
+      [ -e "$_f" ] || continue
+      _n=$(basename "$_f" _input); _n=${_n#fan}
+      _r=$(cat "$_f" 2>/dev/null || echo 0)
+      eval "_nm=\${FAN${_n}_NAME:-}"
+      eval "_sh=\${SHOW_FANCH_${_n}:-\${FANCH_SHOW_DEFAULT:-auto}}"
+      case "$_sh" in
+        off) continue ;;
+        auto) [ "${_r:-0}" -gt 0 ] 2>/dev/null || continue ;;
+      esac
+      if [ -n "$_nm" ]; then
+        _esc=$(printf '%s' "$_nm" | od -An -tx1 | tr -d ' \n' | sed 's/\(..\)/%\1/g')
+      else
+        _esc=""
+      fi
+      FANS="${FANS}fan${_n}:${_r}:${_esc}|"
+    done
+  fi
+fi
+FANS=${FANS%|}
+[ -z "$FANS" ] && FANS="-"
 
 # 磁盘：型号|温度(毫度)|容量
 DISKS=""
@@ -341,9 +375,9 @@ printf '{"cpu_pkg":"%s","cpu_cores":"%s","disks":"%s","board":"%s","fans":"%s","
   "$(je "${CPU_PKG:--}")" "$(je "${CORES:--}")" "$(je "$DISKS")" "$(je "${BOARD:--}")" \
   "$(je "${FANS:--}")" "${CUR:-0}" "${MIN:-0}" "${MAX:-0}" "$(je "$CPUGEN")" "${BASEF:-0}"
 EOS
-  chmod +x "$SH"; changed=1; echo "  [1] 已写 $SH（v8）"
+  chmod +x "$SH"; changed=1; echo "  [1] 已写 $SH（v10）"
 else
-  echo "  [1] $SH 已是 v8，跳过"
+  echo "  [1] $SH 已是 v10，跳过"
 fi
 
 # ---------- 2) 后端：概要取值（tdata）+ 工具集 API（hwtools）----------
@@ -440,7 +474,7 @@ __PACKAGE__->register_method({
             # 仍只允许字母数字下划线点减号冒号逗号，杜绝 shell 元字符——防注入且不误伤合法取值。
             # 键名必须允许**数字**：风扇配置项形如 fan1_mode / fan3_curve。
             # 曾经只写 [a-z_]+，于是 fan1_mode 一律被判非法、保存永远失败。
-            die "非法参数：$kv\\n" if $kv !~ /^[a-z][a-z0-9_]*=[0-9a-zA-Z_.:,-]+$/;
+            die "非法参数：$kv\\n" if $kv !~ /^[a-z][a-z0-9_]*=[0-9a-zA-Z_.:,%+-]*$/;
             push @args, $kv;
         }
         die "没有可写入的配置项\\n" if !@args;
@@ -456,6 +490,123 @@ __PACKAGE__->register_method({
             my $raw = `/usr/local/bin/pve-hwtools-agent status 2>/dev/null`;
             eval { $res = decode_json($raw) };
         }
+        return $res;
+    },
+});
+__PACKAGE__->register_method({
+    name => 'hwfantest',
+    path => 'hwfantest',
+    method => 'POST',
+    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Modify']] },
+    description => "让指定风扇通道短暂改变转速，便于识别对应风扇；完成后自动还原。",
+    proxyto => 'node',
+    # protected => 1 必需：pveproxy 以 www-data 跑，不带此标记会被就地降权执行，
+    # 而 fan-test 要写 sysfs（需 root）。
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            channel => { type => 'integer', minimum => 1, maximum => 32 },
+        },
+    },
+    returns => { type => 'object', properties => {} },
+    code => sub {
+        my ($param) = @_;
+        my $out = '';
+        eval {
+            run_command(['/usr/local/bin/pve-hwtools-agent', 'fan-test', "$param->{channel}"],
+                        outfunc => sub { $out .= shift });
+        };
+        die "测试失败：$@\n" if $@;
+        my $res = {};
+        eval { $res = decode_json($out) };
+        return $res;
+    },
+});
+__PACKAGE__->register_method({
+    name => 'hwfanbind',
+    path => 'hwfanbind',
+    method => 'POST',
+    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Modify']] },
+    description => "自动识别风扇：探测哪些插针真接了风扇，并用 CPU 负载关联推断哪个是 CPU 风扇，随后写回通道名。",
+    proxyto => 'node',
+    # protected => 1：探测要写 sysfs 与 sched 负载，pveproxy 会降权执行，必须回宿主以 root 跑。
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => { node => get_standard_option('pve-node') },
+    },
+    returns => { type => 'object', properties => {} },
+    code => sub {
+        my ($param) = @_;
+        # 后台启动立刻返回：识别要 40~60 秒，同步等会撞代理超时。
+        # 进度与结果都写在 /run/pve-hwtools-fanbind.json，面板按它轮询。
+        my $log = '/run/pve-hwtools-fanbind.log';
+        system('setsid nohup /usr/local/bin/pve-hwtools-agent fan-bind '
+               . '>' . $log . ' 2>&1 < /dev/null &');
+        return { started => 1 };
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'hwfanbindprogress',
+    path => 'hwfanbind-progress',
+    method => 'GET',
+    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Audit']] },
+    description => "查询自动识别风扇的进度（面板轮询用）。",
+    proxyto => 'node',
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => { node => get_standard_option('pve-node') },
+    },
+    returns => { type => 'object', properties => {} },
+    code => sub {
+        my ($param) = @_;
+        my $f = '/run/pve-hwtools-fanbind.json';
+        return { state => 'idle' } if !-r $f;
+        my $raw = '';
+        eval {
+            open(my $fh, '<', $f) or die "$!";
+            local $/; $raw = <$fh>; close($fh);
+        };
+        return { state => 'idle' } if $raw eq '';
+        my $res = {};
+        eval { $res = decode_json($raw) };
+        return $res;
+    },
+});
+__PACKAGE__->register_method({
+    name => 'hwfantestget',
+    path => 'hwfantest-get',
+    method => 'GET',
+    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Audit']] },
+    description => "测试识别（GET 别名）：面板 POST 读不到响应正文，故本地发起、原样回传。",
+    proxyto => 'node',
+    # protected => 1：要写 sysfs（需 root），pveproxy 会降权执行，必须回宿主跑。
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            channel => { type => 'integer', minimum => 1, maximum => 32 },
+        },
+    },
+    returns => { type => 'object', properties => {} },
+    code => sub {
+        my ($param) = @_;
+        my $out = '';
+        my $err = '';
+        eval {
+            run_command(['/usr/local/bin/pve-hwtools-agent', 'fan-test', "$param->{channel}"],
+                        outfunc => sub { $out .= shift },
+                        errfunc => sub { $err .= shift });
+        };
+        $err .= $@ if $@;
+        my $res = {};
+        eval { $res = decode_json($out) };
+        $res->{error} = $err if ($err ne '' && !$res->{error});
         return $res;
     },
 });
@@ -588,10 +739,19 @@ items = """            textField: 'pveversion',
                 try {
                     var x = JSON.parse(v).fans;
                     if (x === '-') { return '-'; }
-                    return x.split(',').map(function (y) {
+                    // 记录形如 fanN:转速:名字（名字为百分号编码，可能为空），用 | 分隔。
+                    // 名字里已禁止含 | ，故可安全按 | 切。
+                    return x.split('|').map(function (y) {
+                        if (!y) { return null; }
                         var q = y.split(':');
-                        return q[0].replace(/^fan/i, 'Fan ') + ' ' + q[1] + ' RPM';
-                    }).join(' | ');
+                        var n = q[0].replace(/^fan/i, '');
+                        var rpm = q[1];
+                        var nm = '';
+                        if (q.length > 2 && q[2]) {
+                            try { nm = decodeURIComponent(q[2]); } catch (e) { nm = q[2]; }
+                        }
+                        return (nm || (gettext('风扇 ') + n)) + ' ' + rpm + ' RPM';
+                    }).filter(function (z) { return z !== null; }).join(' | ');
                 } catch (e) { return '-'; }
             },
         },
@@ -717,6 +877,18 @@ PVE.HW = PVE.HW || {};
 // 隐藏开关关掉的概要行（配置改动后无需重新登录：每次装载概要存储都会重新判读）。
 // 每条目占一行的高度（实测：六条 = 480，故每条 24px，超出即高度不足而出现滚动条）
 PVE.HW.ROW = 24;
+// 百分号编码的名字 → 可读文本（后端为避免 Perl 二次编码，名字以 %XX 传递）
+PVE.HW.dec = function (x) {
+    if (!x) { return ''; }
+    try { return decodeURIComponent(x); } catch (e) { return x; }
+};
+
+// 百分号编码（ASCII 安全）——名字里可能含中文
+PVE.HW.enc = function (x) {
+    if (x === undefined || x === null) { return ''; }
+    try { return encodeURIComponent(x); } catch (e) { return ''; }
+};
+
 PVE.HW.BASE = 480;
 
 // 全部硬件概要条目（供复位用）
@@ -960,6 +1132,20 @@ Ext.define('PVE.node.HwTools', {
                             itemId: 'fanhint',
                             html: '',
                         },
+                        {
+                            xtype: 'container',
+                            layout: 'hbox',
+                            margin: '6 0 2 0',
+                            items: [
+                                { xtype: 'button', text: gettext('自动识别风扇'),
+                                  iconCls: 'fa fa-magic', width: 148,
+                                  handler: function () { me.fanBind(); } },
+                                { xtype: 'button', text: gettext('重新扫描通道'),
+                                  iconCls: 'fa fa-refresh', width: 136,
+                                  margin: '0 0 0 8',
+                                  handler: function () { me.reload(); } },
+                            ],
+                        },
                     ],
                 },
                 {
@@ -1037,7 +1223,7 @@ Ext.define('PVE.node.HwTools', {
                     layout: 'hbox',
                     defaults: { margin: '0 8 0 0', xtype: 'numberfield', width: 76 },
                     items: [
-                        { xtype: 'component', width: 100, margin: '6 8 0 0',
+                        { xtype: 'component', width: 108, margin: '6 8 0 0',
                           html: '<b>' + gettext('通道 ') + n + '</b>' +
                                 '<br/><span style="color:#888">' + (f.rpm || 0) + ' RPM</span>' },
                         { name: 'fan' + n + '_mode', xtype: 'combo', width: 128,
@@ -1058,6 +1244,20 @@ Ext.define('PVE.node.HwTools', {
                           queryMode: 'local', displayField: 'v', valueField: 'val',
                           emptyText: gettext('温度源'), store: { fields: ['v', 'val'], data: sources },
                           value: String(f.sel || '') },
+                        { name: 'fan' + n + '_name', xtype: 'textfield', width: 130,
+                          hideLabel: true, emptyText: gettext('名字（可留空）'),
+                          value: PVE.HW.dec(f.name || '') },
+                        { name: 'show_fanch_' + n, xtype: 'combo', width: 122,
+                          hideLabel: true, editable: false, forceSelection: true,
+                          queryMode: 'local', displayField: 'v', valueField: 'val',
+                          store: { fields: ['v', 'val'], data: [
+                              { v: gettext('自动显示'), val: 'auto' },
+                              { v: gettext('始终显示'), val: 'on' },
+                              { v: gettext('不显示'), val: 'off' } ] },
+                          value: f.show || 'auto' },
+                        { xtype: 'button', text: gettext('测试识别'), width: 86,
+                          margin: '0 0 0 4',
+                          handler: function () { me.fanTest(n); } },
                     ],
                 }));
 
@@ -1081,6 +1281,123 @@ Ext.define('PVE.node.HwTools', {
                 fs.add(crow);
 
                 me.fanSyncRow(n);
+            });
+        },
+
+        // 自动识别：探测哪些插针真接了风扇，再用 CPU 负载关联推断哪个是 CPU 风扇，
+        // 随后自动写好通道名；没接风扇的通道自动隐藏显示。约 20 秒，期间 CPU 会满载。
+        fanBind: function () {
+            var me = this;
+            Ext.Msg.confirm(gettext('自动识别风扇'),
+                gettext('将逐个试探各通道（约 15 秒，期间风扇会有明显响动），识别哪些插针真接了风扇，并按温度源自动起名；未接风扇的通道将自动隐藏。已有名字不会被覆盖。继续？'),
+                function (btn) {
+                    if (btn !== 'yes') { return; }
+                    me.setLoading(gettext('正在识别…'));
+                    // 后台任务 + 轮询：识别要 40~60 秒，一个请求等不下来。
+                    Proxmox.Utils.API2Request({
+                        url: '/nodes/' + me.nodename + '/hwfanbind',
+                        method: 'POST',
+                        success: function () { me.fanBindPoll(0); },
+                        failure: function (r) {
+                            me.setLoading(false);
+                            Ext.Msg.alert(gettext('识别失败'), r.htmlStatus);
+                        },
+                    });
+                });
+        },
+
+        fanBindPoll: function (n) {
+            var me = this;
+            if (n > 60) {
+                me.setLoading(false);
+                Ext.Msg.alert(gettext('识别超时'), gettext('任务未在预期时间内结束，请到节点 Shell 执行 pve-hwtools-agent fan-bind 查看。'));
+                return;
+            }
+            Ext.Ajax.request({
+                url: '/api2/json/nodes/' + me.nodename + '/hwfanbind-progress',
+                method: 'GET',
+                success: function (response) {
+                    var d = {};
+                    try { d = JSON.parse(response.responseText || '{}'); } catch (e) { d = {}; }
+                    d = d.data || {};
+                    if (d.state === 'done') {
+                        me.setLoading(false);
+                        me.fanBindReport(d.result);
+                        me.reload();
+                        return;
+                    }
+                    if (d.state === 'idle') { me.setLoading(false); return; }
+                    me.setLoading((d.step || gettext('识别中…')) + ' ' + (d.pct || 0) + '%');
+                    setTimeout(function () { me.fanBindPoll(n + 1); }, 2000);
+                },
+                failure: function () {
+                    me.setLoading(false);
+                    Ext.Msg.alert(gettext('识别失败'), gettext('无法读取进度，请重试。'));
+                },
+            });
+        },
+
+        // 把识别结果讲清楚——尤其要说明「分不出物理身份」这件事，别让人以为已完全认准。
+        fanBindReport: function (res) {
+            var me = this;
+            var d = res || {};
+            var ch = (d.channels || []);
+            var rows = [];
+            var order = me.stringifyOrder || [];
+            ch.forEach(function (c) {
+                var nm = me.fanNameOf(c.n);
+                rows.push(gettext('通道 ') + c.n + '：' + (c.present
+                    ? (nm ? nm : gettext('已接风扇')) + gettext('　转速 ') + c.rpm + gettext(' RPM')
+                    : gettext('未检测到风扇（已隐藏）')));
+            });
+            var head = gettext('已按「该通道跟随哪一路温度」自动归类命名。');
+            if (d.hidden) { head += gettext(' 未接风扇的通道：') + d.hidden + gettext('，已设为不显示。'); }
+            var tail = '<br/><br/><span style="color:#a60">' + gettext(
+                '注意：主板芯片不提供风扇名称，也无法从硬件区分哪个插头是 CPU 风扇。若名字不对，请点对应行的「测试识别」听声辨位后改名。') + '</span>';
+            Ext.Msg.alert(gettext('识别完成'), head + (rows.length ? ('<br/><br/>' + rows.join('<br/>')) : '') + tail);
+        },
+
+        // 从当前面板里读出某通道现已保存的名字（保存后会回读）
+        fanNameOf: function (n) {
+            var me = this;
+            var c = me.down('[name=fan' + n + '_name]');
+            return c ? PVE.HW.dec(c.getValue() || '') : '';
+        },
+
+
+        // 测试识别：让该通道转一次，便于听声或盯着看辨位。后端做完无条件还原。
+        fanTest: function (n) {
+            var me = this;
+            Ext.Msg.show({
+                title: gettext('测试识别'),
+                msg: gettext('会让通道 ') + n + gettext(' 明显变一次转速（约 15 秒），随后自动还原主板设置。请留意是哪个风扇在响。'),
+                buttons: Ext.Msg.OKCANCEL,
+                icon: Ext.Msg.QUESTION,
+                fn: function (btn) {
+                    if (btn !== 'ok') { return; }
+                    me.setLoading(gettext('测试中…'));
+                    // 走宿主侧 GET 别名而非直发 POST：面板的 POST 响应正文读不到，
+                    // 别名在宿主本地发起请求，结果能完整回传。
+                    Ext.Ajax.request({
+                        url: '/api2/json/nodes/' + me.nodename + '/hwfantest-get?channel=' + n,
+                        method: 'GET',
+                        success: function (response) {
+                            me.setLoading(false);
+                            var r = {};
+                            try { r = JSON.parse(response.responseText || '{}'); } catch (e) { r = {}; }
+                            r = r.data || {};
+                            var txt = r.moved
+                                ? (gettext('已制造明显变化：') + r.before + ' → ' + r.peak + gettext(' RPM，现已还原原状。'))
+                                : (gettext('转速未见明显变化（') + r.before + ' → ' + r.peak + gettext(' RPM）——该通道可能没接风扇，或风扇不支持调速。'));
+                            Ext.Msg.alert(gettext('测试完成'), txt);
+                            me.reload();
+                        },
+                        failure: function (response) {
+                            me.setLoading(false);
+                            Ext.Msg.alert(gettext('测试失败'), response.htmlStatus);
+                        },
+                    });
+                },
             });
         },
 
@@ -1245,6 +1562,11 @@ Ext.define('PVE.node.HwTools', {
             var mode = c.getValue();
             if (!mode) { return; }
             kv.push('fan' + n + '_mode=' + mode);
+            // 名字：即使模式是 off 也要提交（命名与调速是两件事）
+            var nm = me.fanVal('fan' + n + '_name');
+            kv.push('fan' + n + '_name=' + PVE.HW.enc(nm === null ? '' : String(nm)));
+            var sh = me.fanVal('show_fanch_' + n);
+            if (sh) { kv.push('show_fanch_' + n + '=' + sh); }
             if (mode === 'manual') {
                 kv.push('fan' + n + '_manual=' + Math.round(me.fanVal('fan' + n + '_manual')));
             } else if (mode === 'auto') {

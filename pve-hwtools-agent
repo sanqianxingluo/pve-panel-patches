@@ -1,5 +1,5 @@
 #!/bin/bash
-# pve-hwtools-agent —— PVE 工具集状态代理（V2.4）
+# pve-hwtools-agent —— PVE 工具集状态代理（V2.7）
 #
 # 唯一的配置真相：/etc/default/pve-hwtools
 # 职责：读/写该配置；施加 CPU 调频；按配置触发界面重渲染。
@@ -44,6 +44,15 @@ defaults() {
   FAN5_MODE=off; FAN5_SEL=2; FAN5_MANUAL=128; FAN5_CURVE=25:30,30:60,45:120,60:200,80:255
   FAN6_MODE=off; FAN6_SEL=2; FAN6_MANUAL=128; FAN6_CURVE=25:30,30:60,45:120,60:200,80:255
   FAN7_MODE=off; FAN7_SEL=2; FAN7_MANUAL=128; FAN7_CURVE=25:30,30:60,45:120,60:200,80:255
+  # 概要页显示：auto = 有转速才显示 / on = 始终显示 / off = 不显示
+  # 默认 auto —— 没接风扇的插针自动不出现，不必手工一个个关
+  FANCH_SHOW_DEFAULT=auto
+  SHOW_FANCH_1=auto; SHOW_FANCH_2=auto; SHOW_FANCH_3=auto; SHOW_FANCH_4=auto
+  SHOW_FANCH_5=auto; SHOW_FANCH_6=auto; SHOW_FANCH_7=auto
+  # 各通道名字（**通道号与名字是两件事**：芯片只给温度起名，风扇名要用户绑定）
+  #   留空 = 未命名，界面显示「通道 N」
+  FAN1_NAME=; FAN2_NAME=; FAN3_NAME=; FAN4_NAME=
+  FAN5_NAME=; FAN6_NAME=; FAN7_NAME=
 }
 
 # 把可能是历史 kHz 写法的值折算成 MHz（>10000 视为 kHz）
@@ -60,6 +69,15 @@ load_conf() {
     . "$CONF"
     CPU_FREQ_MIN=$(to_mhz "$CPU_FREQ_MIN")
     CPU_FREQ_MAX=$(to_mhz "$CPU_FREQ_MAX")
+    # 幂等迁移：老配置里没有 SHOW_FANCH_n，补成 auto。
+    #   只补缺失项，绝不覆盖用户已设的值。
+    local _n _v
+    for _n in $(fan_channels); do
+      eval "_v=\${SHOW_FANCH_${_n}:-auto}"
+      eval "SHOW_FANCH_${_n}=\$_v"
+      eval "_v=\${FAN${_n}_NAME:-}"
+      eval "FAN${_n}_NAME=\$_v"
+    done
   fi
   return 0
 }
@@ -191,7 +209,6 @@ fan_channels() {
 
 fan_rpm()  { local d; d=$(nct_dir) || { printf '0'; return; }; cat "$d/fan${1}_input" 2>/dev/null || printf '0'; }
 fan_enable(){ local d; d=$(nct_dir) || return; cat "$d/pwm${1}_enable" 2>/dev/null; }
-fan_temp_sel(){ local d; d=$(nct_dir) || return; cat "$d/pwm${1}_temp_sel" 2>/dev/null; }
 
 # 可选温度源：只保留读数为 0 以外、且标签不像 AUXTIN 空脚的
 fan_temp_sources() {
@@ -266,6 +283,315 @@ valid_curve() {
 
 valid_fan_mode() { case "$1" in off|auto|manual) VALID="$1" ;; *) die "风扇模式只能是 off / auto / manual：$1" ;; esac; }
 
+# 概要页显示设置：auto 只显示在转的 / on 始终显示 / off 不显示
+valid_fanch() { case "$1" in auto|on|off) VALID="$1" ;; *) die "显示设置只能是 auto / on / off：$1" ;; esac; }
+
+# 编码为百分号形式。为何要编码：
+#   ① 本代理的输出会经 Perl 反引号读入，UTF-8 会被二次编码成乱码（实测中文整段丢失）；
+#   ② 编码后是纯 ASCII，既能安全穿过 Perl 与 JSON，也能被前端 decodeURIComponent 还原。
+url_encode() {
+  local v="$1"
+  [ -n "$v" ] || { printf ''; return 0; }
+  printf '%s' "$v" | od -An -tx1 | tr -d ' \n' | sed 's/\(..\)/%\1/g'
+}
+
+# 解码前端传来的百分号编码名字（前端 encodeURIComponent）。
+#   为何要编码：名字可能含空格或中文，而参数之间用空格分隔、后端正则只放行 ASCII；
+#   编码后是纯 ASCII，既不破分隔符也不破正则。
+url_decode() {
+  local v="$1"
+  v="${v//+/ }"
+  printf '%b' "${v//%/\\x}"
+}
+
+# 名字：留空表示清除；非空则限长、去控制字符。
+#   名字里不得含 | , = —— 会与概要页的分隔符打架。
+valid_fan_name() {
+  local v="$1"
+  v=$(url_decode "$v")
+  v=$(printf '%s' "$v" | tr -d '\000-\037')   # 剥掉全部控制字符（含制表/回车）
+  v=$(printf '%s' "$v" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ ${#v} -le 32 ] || die "名字过长（最多 32 个字符）"
+  # 禁掉 | , = 与单引号：前三个会与概要分隔符/配置语法打架；
+  #   单引号必须禁 —— 配置值用单引号包裹，值里再有单引号就得转义，极易写错。
+  case "$v" in *"|"*|*,*|*=*) die "名字里不能含 | , = 这几个字符" ;; esac
+  case "$v" in *"'"*) die "名字里不能含单引号" ;; esac
+  VALID="$v"
+}
+
+# 配置文件里的值要用单引号包住：该文件是被 bash source 的，
+#   若值含空格（如「CPU 风扇」）而不加引号，bash 会把后面的词当成命令去执行，
+#   于是每次读配置都冒 `line N: xxx: command not found`，且名字本身也读不全。
+q_conf() { printf "'%s'" "$1"; }
+
+# ── 手动写占空比：**必须先 enable、再写 pwm** ──
+#   实测（NCT6798D）：若先写 pwm 再 enable，风扇会先掉速（SmartFan→手动的切换
+#   瞬间占空比被清零/锁存到旧值），出现「写 255 反而变慢」的怪象；
+#   先 enable 则 pwm 被锁存为当前值，再写目标值即刻生效（255→1605RPM、60→528RPM 实测）。
+fan_set_manual() {
+  local n="$1" v="$2" d; d=$(nct_dir) || return 0
+  printf '1' > "$d/pwm${n}_enable" 2>/dev/null
+  printf '%s' "$v" > "$d/pwm${n}" 2>/dev/null
+}
+
+# ── 测试识别：让指定通道明显变一次转速，便于听声或盯着看辨位 ──
+#   安全：先存基线 → 取与当前差异明显的安全占空比 → 约 10 秒后**无条件还原基线**。
+#   绝不写 0；若当前已接近满速，改用一个较低值，制造可闻的「降速」差异。
+cmd_fan_test() {
+  need_root
+  load_conf
+  valid_fan_channel "${1:-}"; local n=$VALID
+  nct_dir >/dev/null 2>&1 || die "本机无可控风扇芯片"
+  local before cur target peak after i t
+  before=$(fan_rpm "$n")
+  cur=$(cat "$(nct_dir)/pwm${n}" 2>/dev/null || echo 128)
+  # 目标值：与当前差异越大越容易听出来。已接近满速就改走低值。
+  if [ "${cur:-0}" -gt 150 ] 2>/dev/null; then target=60; else target=255; fi
+  fan_save_baseline "$n"
+  fan_set_manual "$n" "$target"
+  peak=0
+  for i in 1 2 3 4; do
+    sleep 2
+    t=$(fan_rpm "$n")
+    [ "$t" -gt "$peak" ] && peak=$t
+  done
+  fan_restore_baseline "$n"
+  sleep 4
+  after=$(fan_rpm "$n")
+  # 如实报告：峰值是否明显偏离起始值（听得出差异才算成功）
+  local moved=false
+  if [ "$before" -gt 0 ] && [ "$peak" -gt 0 ]; then
+    local diff=$(( peak - before )); [ "$diff" -lt 0 ] && diff=$(( -diff ))
+    [ "$diff" -ge 150 ] && moved=true
+  elif [ "$before" -le 0 ] && [ "$peak" -gt 0 ]; then
+    moved=true
+  fi
+  printf '{"channel":%s,"before":%s,"peak":%s,"after":%s,"target":%s,"moved":%s,"restored":%s}\n' \
+    "$n" "$before" "$peak" "$after" "$target" "$moved" "$([ "$before" -eq 0 ] || [ "$after" -gt 0 ] && echo true || echo false)"
+}
+
+# ── 自动识别：逐通道试转，判出哪些通道真接着风扇 ──
+#   判据：本来就转 => 有；原本 0 转、施加占空比后转起来 => 有；施加后仍 0 => 无。
+#   每个通道做完立即还原，绝不留改动。
+# ═══════════════════════════════════════════════════════════════
+# 自动识别：先探哪些插针真接了风扇，再用 CPU 负载关联找出哪一个是 CPU 风扇。
+#   芯片不提供风扇名（fan*_label 全空），所以只能靠「试转 + 负载响应」推断。
+#   未接风扇的通道标记 present=false，由调用方决定是否隐藏显示。
+#   全程保基线、无条件还原——认风扇不能把用户风扇留在手动全速。
+# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# 自动识别：先探哪些插针真接了风扇，再用 CPU 负载关联找出哪一个是 CPU 风扇。
+#   芯片不提供风扇名（fan*_label 全空），只能靠「试转 + 负载响应」推断。
+#   内部一律走 TSV（n rpm peak present bp），最后才拼 JSON——
+#   对 JSON 直接做 sed 太脆：模式失配时会把整条记录当数字做算术，当场报错。
+#   全程保基线、无条件还原：认风扇不能把用户风扇留在手动全速。
+# ═══════════════════════════════════════════════════════════════
+fan_rpm_peak() {
+  # 采样若干次取峰值：转速表有噪声，单次读数容易被误判
+  local n="$1" k="${2:-5}" i v p=0
+  for i in $(seq 1 "$k"); do
+    v=$(fan_rpm "$n")
+    [ "$v" -gt "$p" ] && p=$v
+    sleep 1
+  done
+  printf '%s' "$p"
+}
+
+# 一次完整扫描，回传 TSV：n / 静止转速 / 静止峰值 / 是否接了风扇 / 满载峰值
+fan_detect_full() {
+  need_root
+  local d; d=$(nct_dir) || return 0
+  local n before peak present
+  local -a NS=() RPM=() PEAK=() PRES=()
+
+  # ── 第一轮：存在性。只碰基线转速为 0 的通道——正在转的已确认有风扇，
+  #    而且动它风险最大（可能把用户正在用的风扇拽到手动全速）。
+  for n in $(fan_channels); do
+    before=$(fan_rpm "$n"); present=0; peak=$before
+    if [ "$before" -le 0 ]; then
+      fan_save_baseline "$n"
+      # 先 enable 再 pwm：反序会让风扇先掉速（实测踩过）
+      printf '1' > "$d/pwm${n}_enable" 2>/dev/null
+      printf '255' > "$d/pwm${n}" 2>/dev/null
+      sleep 3
+      peak=$(fan_rpm "$n")
+      [ "$peak" -gt 0 ] && present=1
+      fan_restore_baseline "$n"
+    else
+      present=1
+    fi
+    NS+=("$n"); RPM+=("$before"); PEAK+=("$peak"); PRES+=("$present")
+  done
+
+  # ── 第二轮：CPU 负载关联。真正贴着 CPU 的那个通道，满载时会明显提速。
+  #    轮询采样（每轮把所有通道读一遍、共 5 轮）比逐通道各采 6 秒快得多，
+  #    也更容易命中负载峰值窗口。
+  local ncore; ncore=$(nproc 2>/dev/null || echo 4)
+  [ "$ncore" -gt 8 ] && ncore=8
+  timeout 22 bash -c "for i in \$(seq 1 $ncore); do while :; do :; done & done; wait" >/dev/null 2>&1 &
+  local loadpid=$!
+  sleep 5
+
+  local -A PEAKM=()
+  local p v cur
+  for p in 1 2 3 4 5 6; do
+    for n in "${NS[@]}"; do
+      v=$(fan_rpm "$n")
+      cur=${PEAKM[$n]:-0}
+      [ "$v" -gt "$cur" ] && PEAKM[$n]=$v
+    done
+    sleep 1
+  done
+  kill "$loadpid" 2>/dev/null
+  wait "$loadpid" 2>/dev/null
+  sleep 2
+
+  local i
+  for i in "${!NS[@]}"; do
+    printf '%s\t%s\t%s\t%s\t%s\n' "${NS[$i]}" "${RPM[$i]}" "${PEAK[$i]}" "${PRES[$i]}" "${PEAKM[${NS[$i]}]:-0}"
+  done
+}
+
+cmd_fan_detect() {
+  need_root
+  local out="" n rpm peak pres bp
+  while IFS=$(printf '\t') read -r n rpm peak pres bp; do
+    [ -z "$n" ] && continue
+    local delta=0
+    if [ "$pres" = "1" ]; then
+      delta=$(( ${bp:-0} - peak )); [ "$delta" -lt 0 ] && delta=0
+    fi
+    out="$out{\"n\":$n,\"rpm\":$rpm,\"peak\":$peak,\"present\":$([ "$pres" = 1 ] && echo true || echo false),\"delta\":$delta},"
+  done <<EOF
+$(fan_detect_full)
+EOF
+  printf '{"channels":[%s]}\n' "${out%,}"
+}
+
+# 自动绑定：把识别结果写成通道名（CPU 风扇 / 机箱风扇 N），未接风扇的通道
+# 显示策略设为 off，免得面板上挂一排 0 转的假风扇。
+# ═══════════════════════════════════════════════════════════════
+# 自动绑定风扇（后台任务，结果写 FANPROG 供面板轮询）
+#
+# 判据分两级，缺一不可：
+#  ① 结构证据：pwmN_temp_sel 声明该通道跟随哪个温度源。指向 PECI（CPU 自身
+#     温度）的，多半就是 CPU 风扇；指向未接传感器的通道基本是空插针。
+#  ② 实测证据（决定性）：把该通道转速压低，看 CPU 温度是否上升。真在给 CPU
+#     散热的风扇，减速后 PECI 一定升温；不是的则几乎不动。
+#     只靠 ① 会误判（主板默认整排都指向同一路），只靠「听声响」不可复现。
+#
+# 全程保基线、无条件还原。减速取基线的一半（不是 0），避免把 CPU 逼到降频；
+# 每通道测 45 秒，CPU 温度上限远高于阈值，安全。
+# ═══════════════════════════════════════════════════════════════
+FANPROG=/run/pve-hwtools-fanbind.json
+
+fan_prog() {
+  # 进度文件：面板按它显示阶段与百分比
+  printf '{"state":"%s","step":"%s","pct":%s,"ts":%s,"result":%s}\n' \
+    "$1" "$2" "$3" "$(date +%s)" "${4:-null}" > "$FANPROG" 2>/dev/null
+}
+
+# 找出 PECI（CPU 自身温度）对应的 tempN 编号——不同主板编号不同，必须按名字找
+peci_temp_index() {
+  local d t
+  d=$(nct_dir) || return 0
+  for t in $(seq 1 16); do
+    if [ -r "$d/temp${t}_label" ]; then
+      case "$(cat "$d/temp${t}_label" 2>/dev/null)" in
+        *PECI*|*peci*) printf '%s' "$t"; return 0 ;;
+      esac
+    fi
+  done
+  # 退而求其次：用 CPUTIN
+  for t in $(seq 1 16); do
+    if [ -r "$d/temp${t}_label" ]; then
+      case "$(cat "$d/temp${t}_label" 2>/dev/null)" in
+        *CPUTIN*) printf '%s' "$t"; return 0 ;;
+      esac
+    fi
+  done
+  return 0
+}
+
+# 该通道声明的温度源（temp_sel），读不到就给空
+fan_temp_sel() {
+  local n="$1" d; d=$(nct_dir) || return 0
+  [ -r "$d/pwm${n}_temp_sel" ] && cat "$d/pwm${n}_temp_sel" 2>/dev/null
+}
+
+# 实测：把通道 n 减速后，PECI 升温多少度（整数，单位 0.001°C → 这里换算成 mC 差）
+
+# 自动绑定：只做能被证实的判断，不猜测硬件没有的信息。
+#   能证实的三件事：
+#     ① 哪个插针真接了风扇（静止的插针试转一下，转起来就是有）；
+#     ② 该通道的温度源（pwmN_temp_sel 是芯片自己声明的，读得到）；
+#     ③ 生成的名字是否合法（写配置前校验）。
+#   证不了的事：**物理上哪个是 CPU 风扇**。实测过——把通道 1 从 1108 转压到 349 转，
+#   PECI 只从 47000 动到 46000（1°C，在噪声里）。这颗 CPU 待机功耗太低，
+#   靠升温差判不出来；强行给结论就是编的。所以名字只按温度源归类，
+#   并在结果里如实说明「分不出物理身份，请用测试识别听声」。
+#   已有名字一律保留——那是用户自己标的，比推断可信。
+cmd_fan_bind() {
+  need_root
+  load_conf
+  local d; d=$(nct_dir) || { printf '{"channels":[]}\n'; return 0; }
+  local pi; pi=$(peci_temp_index)
+  fan_prog running "正在探测试转各插针…" 20
+
+  local out="" names="" hides="" hidden=""
+  local sys_i=0 cpu_i=0 n enc tsel cls label cur
+  for n in $(fan_channels); do
+    local before peak present
+    before=$(fan_rpm "$n"); present=false; peak=$before
+    if [ "$before" -gt 0 ]; then
+      # 已在转：已确认有风扇，且动它风险最大——绝不打扰
+      present=true
+    else
+      fan_save_baseline "$n"
+      # 先 enable 再 pwm：反序会让风扇先掉速（实测踩过）
+      printf '1' > "$d/pwm${n}_enable" 2>/dev/null
+      printf '255' > "$d/pwm${n}" 2>/dev/null
+      sleep 3
+      peak=$(fan_rpm "$n")
+      [ "$peak" -gt 0 ] && present=true
+      fan_restore_baseline "$n"
+    fi
+
+    tsel=$(fan_temp_sel "$n")
+    if [ -n "$pi" ] && [ "$tsel" = "$pi" ]; then cls="cpu"; else cls="sys"; fi
+
+    if [ "$present" != "true" ]; then
+      hidden="$hidden $n"
+      hides="$hides show_fanch_${n}=off"
+    else
+      cur=$(eval "printf '%s' \"\${FAN${n}_NAME:-}\"")
+      if [ -z "$cur" ]; then
+        if [ "$cls" = "cpu" ]; then
+          cpu_i=$((cpu_i + 1))
+          label="CPU 风扇"
+          [ "$cpu_i" -gt 1 ] && label="CPU 风扇 $cpu_i"
+        else
+          sys_i=$((sys_i + 1)); label="机箱风扇 $sys_i"
+        fi
+        enc=$(printf '%s' "$label" | od -An -tx1 | tr -d ' \n' | sed 's/\(..\)/%\1/g')
+        names="$names fan${n}_name=$enc"
+      fi
+    fi
+    out="$out{\"n\":$n,\"rpm\":$before,\"peak\":$peak,\"present\":$present,\"temp_sel\":\"$tsel\",\"class\":\"$cls\"},"
+  done
+
+  fan_prog running "正在写入通道名与显示设置…" 85
+  local all="$names$hides"
+  [ -n "$all" ] && cmd_set $all >/dev/null 2>&1
+
+  # 结果必须写进进度文件——面板靠它显示明细；只打 stdout 面板看不到
+  local js
+  js=$(printf '{"channels":[%s],"cpu_temp":"%s","hidden":"%s"}' \
+    "${out%,}" "$pi" "$(printf '%s' "$hidden" | sed 's/^ //')")
+  fan_prog done "识别完成" 100 "$js"
+  printf '%s\n' "$js"
+}
+
 # 通道必须真实存在——否则写进配置也毫无作用，只会让人误以为设好了
 valid_fan_channel() {
   local v="$1" n
@@ -309,8 +635,7 @@ fan_apply_one() {   # $1=通道号
       fan_restore_baseline "$n"
       return 0 ;;
     manual)
-      [ -e "$d/pwm${n}" ] && printf '%s' "$man" > "$d/pwm${n}" 2>/dev/null
-      [ -e "$d/pwm${n}_enable" ] && printf '1' > "$d/pwm${n}_enable" 2>/dev/null
+      fan_set_manual "$n" "$man"
       ;;
     auto)
       [ -e "$d/pwm${n}_temp_sel" ] && printf '%s' "$sel" > "$d/pwm${n}_temp_sel" 2>/dev/null
@@ -349,15 +674,17 @@ fan_status_json() {
   local n d out=""
   d=$(nct_dir) 2>/dev/null || { printf '[]'; return; }
   for n in $(fan_channels); do
-    local mode sel man curve en pwm rpm
+    local mode sel man curve en pwm rpm show nm
+    eval "nm=\${FAN${n}_NAME:-}"
     eval "mode=\${FAN${n}_MODE:-off}"
     eval "sel=\${FAN${n}_SEL:-2}"
     eval "man=\${FAN${n}_MANUAL:-128}"
     eval "curve=\${FAN${n}_CURVE:-25:30,30:60,45:120,60:200,80:255}"
+    eval "show=\${SHOW_FANCH_${n}:-${FANCH_SHOW_DEFAULT:-auto}}"
     en=$(cat "$d/pwm${n}_enable" 2>/dev/null || echo -1)
     pwm=$(cat "$d/pwm${n}" 2>/dev/null || echo -1)
     rpm=$(fan_rpm "$n")
-    out="$out{\"n\":$n,\"rpm\":$rpm,\"enable\":$en,\"pwm\":$pwm,\"mode\":\"$mode\",\"sel\":$sel,\"manual\":$man,\"curve\":\"$curve\"},"
+    out="$out{\"n\":$n,\"rpm\":$rpm,\"enable\":$en,\"pwm\":$pwm,\"mode\":\"$mode\",\"sel\":$sel,\"manual\":$man,\"curve\":\"$curve\",\"show\":\"$show\",\"name\":\"$(url_encode "$nm")\"},"
   done
   printf '[%s]' "${out%,}"
 }
@@ -475,6 +802,27 @@ FAN7_MODE=$FAN7_MODE
 FAN7_SEL=$FAN7_SEL
 FAN7_MANUAL=$FAN7_MANUAL
 FAN7_CURVE=$FAN7_CURVE
+#
+# 概要页显示（每通道）：auto = 有转速才显示 / on = 始终显示 / off = 不显示
+#   没接风扇的插针默认 auto 即自动隐藏，无需逐个关闭
+FANCH_SHOW_DEFAULT=${FANCH_SHOW_DEFAULT:-auto}
+SHOW_FANCH_1=${SHOW_FANCH_1:-auto}
+SHOW_FANCH_2=${SHOW_FANCH_2:-auto}
+SHOW_FANCH_3=${SHOW_FANCH_3:-auto}
+SHOW_FANCH_4=${SHOW_FANCH_4:-auto}
+SHOW_FANCH_5=${SHOW_FANCH_5:-auto}
+SHOW_FANCH_6=${SHOW_FANCH_6:-auto}
+SHOW_FANCH_7=${SHOW_FANCH_7:-auto}
+#
+# 各通道名字（通道号 != 名字；芯片不提供风扇名，由这里绑定）
+#   留空则界面显示「通道 N」
+FAN1_NAME=$(q_conf "$FAN1_NAME")
+FAN2_NAME=$(q_conf "$FAN2_NAME")
+FAN3_NAME=$(q_conf "$FAN3_NAME")
+FAN4_NAME=$(q_conf "$FAN4_NAME")
+FAN5_NAME=$(q_conf "$FAN5_NAME")
+FAN6_NAME=$(q_conf "$FAN6_NAME")
+FAN7_NAME=$(q_conf "$FAN7_NAME")
 EOF
   chmod 644 "$CONF"
 }
@@ -586,6 +934,15 @@ cmd_set() {
         local fn="${k#fan}"; fn="${fn%_curve}"
         valid_fan_channel "$fn"; fn=$VALID
         valid_curve "$v"; eval "FAN${fn}_CURVE=\$VALID"; fan_changed=1 ;;
+      fan*_name)
+        local fn="${k#fan}"; fn="${fn%_name}"
+        valid_fan_channel "$fn"; fn=$VALID
+        valid_fan_name "$v"; eval "FAN${fn}_NAME=\$VALID" ;;
+      show_fanch_*)
+        # 纯显示设置，不碰硬件，故不置 fan_changed（避免无谓地重写 PWM）
+        local fn="${k#show_fanch_}"
+        valid_fan_channel "$fn"; fn=$VALID
+        valid_fanch "$v"; eval "SHOW_FANCH_${fn}=\$VALID" ;;
       *) die "未知配置项：$k" ;;
     esac
   done
@@ -636,5 +993,9 @@ case "${1:-status}" in
   set) shift; cmd_set "$@" ;;
   apply) cmd_apply ;;
   mirrors) cmd_mirrors ;;
-  *) die "用法：pve-hwtools-agent {status|set k=v...|apply|mirrors}" ;;
+  fan-test) shift; cmd_fan_test "${1:-}" ;;
+    fan-detect) cmd_fan_detect ;;
+    fan-bind) cmd_fan_bind ;;
+    fan-bind-progress) cat /run/pve-hwtools-fanbind.json 2>/dev/null || printf '{"state":"idle"}\n' ;;
+    *) die "用法：pve-hwtools-agent {status|set k=v...|apply|mirrors|fan-test N|fan-detect|fan-bind|fan-bind-progress}" ;;
 esac
