@@ -1,5 +1,5 @@
 #!/bin/bash
-# pve-hwtools-agent —— PVE 工具集状态代理（V2.8）
+# pve-hwtools-agent —— PVE 工具集状态代理（V2.9）
 #
 # 唯一的配置真相：/etc/default/pve-hwtools
 # 职责：读/写该配置；施加 CPU 调频；按配置触发界面重渲染。
@@ -167,44 +167,230 @@ else
   cpu_gen()    { printf '%s family %s model %s' "$(cpu_vendor)" "$(cpu_fam)" "$(cpu_mod)"; }
 fi
 
-# ---------- 风扇控制 ----------
-# 硬件：NCT6798D（nct6775 驱动）。能力已实测（2026-09-24）：
+# ---------- 风扇：能力自动探测 ----------
+# 硬件：本机 NCT6798D（nct6775 驱动）。能力已实测（2026-09-24）：
 #   pwmN_enable 语义：0=全速 1=手动定值 2=温度巡航 3=转速巡航 5=SmartFanIV（硬件曲线）
 #                    4=SmartFanIII 在本芯片上被驱动拒绝（6798 只有 IV）
-#   五个曲线点 writeable，温度单位毫摄氏度、占空比 0-255。硬件自动执行，**无需守护进程**。
+#   五个曲线点可写，温度单位毫摄氏度、占空比 0-255。硬件自动执行，**无需守护进程**。
+#
+# **探测不写死型号**：换主板往往换的是另一颗 Super I/O。若按型号白名单找，换成白名单外
+#   的芯片就直接找不到、功能无提示地哑掉。故一律按「能力」找：哪个 hwmon 目录里同时有
+#   可写的 pwmN，就是可控风扇芯片。型号家族仅用于**排序**，不是准入门槛。
+#   探测结果按 HWID（芯片名 + 该芯片可见通道集合）缓存；换主板或换内核后由
+#   「重新扫描通道」按钮或 `fan-rescan` 强制重探，并重置原值基线。
 #
 # 安全设计（这块是能烧硬件的，务必守）：
 #   * 默认 MODE=off —— 什么都不动，沿用主板自己的策略。装上本补丁不会改变风扇行为。
 #   * 首次碰某通道前，把它**全部原始值**存进 $FANBASE（每通道一份），MODE=off 即按此还原。
 #   * 施加后 3 秒复读转速：原本在转、现在变 0 → **立即还原并报错**（防写错把风扇弄停）。
 #   * 手动值下限强制 >= $FAN_PWM_MIN，绝不写 0。
+#   * **换硬件后基线必须重存**：换主板后旧的 pwmN.saved 记的是**别的芯片**的原值，
+#     拿它还原等于把前一块板子的设置往新板子上写。
 FANBASE=/usr/local/lib/pve-hwtools/fan-baseline
 FAN_PWM_MIN=1          # 手动占空比下限（0=停转，一律禁止）
+FAN_REGISTRY=/usr/local/lib/pve-hwtools/fanscan.conf
 
-# nct 芯片所在的 hwmon 目录——**必须按名字现找**，hwmon 序号会随内核/设备变动而变
-nct_dir() {
-  local h n
-  for h in /sys/class/hwmon/hwmon*; do
-    [ -r "$h/name" ] || continue
-    n=$(cat "$h/name" 2>/dev/null)
-    case "$n" in nct6775|nct6776|nct6779|nct6791|nct6792|nct6793|nct6795|nct6796|nct6797|nct6798|nct6683|nct6686|nct6687)
-      printf '%s' "$h"; return 0 ;;
-    esac
+# 已知 Super I/O 家族（**只用于排序**，不是准入门槛）
+fan_chip_rank() {
+  case "$1" in
+    nct6775|nct6776|nct6779|nct6791|nct6792|nct6793|nct6795|nct6796|nct6797|nct6798)
+      printf '1' ;;   # Nuvoton NCT67xx（家用主板最常见的 Super I/O）
+    nct6683|nct6686|nct6687)
+      printf '2' ;;   # Nuvoton NCT668x
+    it87|it8688|it8686|it8792|it8728|it8772|it8620|it8628)
+      printf '3' ;;   # ITE IT87xx（另一大派）
+    f71882fg|f71868|f71869|f71889|f81866|f81865)
+      printf '4' ;;   # Fintek
+    w83627ehf|w83627dhg|w83667hg|w83677)
+      printf '5' ;;   # Winbond
+    *) printf '9' ;;  # 其他：不排除，只是排在后面
+  esac
+}
+
+# 某个 hwmon 目录里是否存在**可写的裸 pwmN**
+fan_dir_usable() {
+  local d="$1" f b n
+  for f in "$d"/pwm[0-9]*; do
+    [ -e "$f" ] || continue
+    b=$(basename "$f"); n=${b#pwm}
+    case "$n" in ''|*[!0-9]*) continue ;; esac   # 跳过 pwm1_enable 这类带后缀的
+    [ -w "$f" ] && return 0
   done
   return 1
 }
 
-# 本机存在的 pwm 通道号（形如 "1 2 3 4 5 7"）
-fan_channels() {
-  local d; d=$(nct_dir) || return 0
-  local f n out=""
+# 某个 hwmon 目录的通道指纹：形如 "1,2,3,4,5,7"
+fan_dir_fingerprint() {
+  local d="$1" f b n out=""
   for f in "$d"/pwm[0-9]*; do
     [ -e "$f" ] || continue
-    n=$(basename "$f"); n=${n#pwm}
-    case "$n" in *[!0-9]*) continue ;; esac
+    b=$(basename "$f"); n=${b#pwm}
+    case "$n" in ''|*[!0-9]*) continue ;; esac
     case " $out " in *" $n "*) ;; *) out="$out $n" ;; esac
   done
-  printf '%s' "${out# }"
+  printf '%s' "$(printf '%s' "${out# }" | tr ' ' ',')"
+}
+
+# 按能力找芯片目录（型号只影响排序，不影响能不能找到）
+fan_chip_dir() {
+  local best="" bestrank=99 h n rank
+  for h in /sys/class/hwmon/hwmon*; do
+    [ -r "$h/name" ] || continue
+    fan_dir_usable "$h" || continue
+    n=$(cat "$h/name" 2>/dev/null)
+    rank=$(fan_chip_rank "$n")
+    if [ -z "$best" ] || [ "$rank" -lt "$bestrank" ]; then bestrank=$rank; best=$h; fi
+  done
+  [ -n "$best" ] && { printf '%s' "$best"; return 0; }
+  return 1
+}
+
+# 旧名兼容（脚本其余各处仍调用 nct_dir）
+nct_dir() { fan_chip_dir; }
+
+# 硬件指纹：芯片名 + 该芯片可见通道集合。
+#   换主板 → 芯片名变（或芯片数变）→ 指纹变 → 触发重探与基线重置判断。
+hwid() {
+  local d n
+  d=$(fan_chip_dir) || { printf 'none'; return 0; }
+  n=$(cat "$d/name" 2>/dev/null)
+  printf '%s:ch%s' "$n" "$(fan_dir_fingerprint "$d")"
+}
+
+# 本机存在的 pwm 通道号（形如 "1 2 3 4 5 7"）
+fan_channels() {
+  local d; d=$(fan_chip_dir) || return 0
+  printf '%s' "$(fan_dir_fingerprint "$d" | tr ',' ' ')"
+}
+
+# 从探测缓存取键（无则给默认）
+scan_get() {   # $1=键  $2=默认
+  local k="$1" def="${2:-}" v
+  [ -r "$FAN_REGISTRY" ] || { printf '%s' "$def"; return 0; }
+  v=$(sed -n "s/^${k}=//p" "$FAN_REGISTRY" 2>/dev/null | tail -1)
+  [ -n "$v" ] && printf '%s' "$v" || printf '%s' "$def"
+}
+
+scan_hwid() { scan_get 'SCAN_HWID' ''; }
+
+# 紧凑格式（目录|名称|通道|可用; …）→ JSON 数组
+scan_all_json() {   # $1=紧凑串（空则读缓存）
+  local flat="${1:-$(scan_get 'SCAN_ALL' '')}"
+  [ -n "$flat" ] || { printf '[]'; return 0; }
+  local rec dir nm ch us out=""
+  # 注意：此处**不要**用 `local IFS` —— `set -u` 下声明后未赋值就引用会报 unbound
+  local savesep="$IFS"
+  IFS=';'
+  for rec in $flat; do
+    IFS='|' read -r dir nm ch us <<EOF
+$rec
+EOF
+    [ -n "$dir" ] || continue
+    out="$out{\"dir\":\"$(json_esc "$dir")\",\"name\":\"$(json_esc "$nm")\",\"channels\":\"$(json_esc "$ch")\",\"usable\":$([ "$us" = true ] && echo true || echo false)},"
+  done
+  IFS="$savesep"
+  printf '[%s]' "${out%,}"
+}
+
+# 完整探测并写缓存；返回 JSON 摘要
+cmd_fan_rescan() {   # $1=keep（1=保留已有通道名与显示设置）
+  need_root
+  local keep="${1:-0}"
+  local h n fp usable rank
+  local chosen="" chosenname="" chosenrank=99
+  local -a ALLD=() ALLN=() ALLC=() ALLU=()
+
+  for h in /sys/class/hwmon/hwmon*; do
+    [ -r "$h/name" ] || continue
+    n=$(cat "$h/name" 2>/dev/null)
+    fp=$(fan_dir_fingerprint "$h")
+    if fan_dir_usable "$h"; then usable=true; else usable=false; fi
+    ALLD+=("$h"); ALLN+=("$n"); ALLC+=("$fp"); ALLU+=("$usable")
+    [ "$usable" = true ] || continue
+    rank=$(fan_chip_rank "$n")
+    if [ -z "$chosen" ] || [ "$rank" -lt "$chosenrank" ]; then
+      chosenrank=$rank; chosen="$h"; chosenname="$n"
+    fi
+  done
+
+  # 缓存里存**紧凑无引号格式**（目录|名称|通道|可用，记录间用 ; ）：
+  #   带引号的 JSON 存进 shell 变量、再拼回 JSON，转义层数极易搞错
+  #   （实测 heredoc 里的 \" 不会被剥掉，拼出来就是非法记号）。
+  local i allflat=""
+  for i in "${!ALLD[@]}"; do
+    allflat="${allflat}${ALLD[$i]}|${ALLN[$i]}|${ALLC[$i]}|${ALLU[$i]};"
+  done
+  allflat="${allflat%;}"
+
+  local sig="none" chipdir="" ch=""
+  if [ -n "$chosen" ]; then
+    sig="${chosenname}:ch$(fan_dir_fingerprint "$chosen")"
+    ch=$(fan_dir_fingerprint "$chosen" | tr ',' ' ')
+    chipdir="$chosen"
+  fi
+
+  # 清理旧的通道配置。
+  #   keep=1：全留。
+  #   keep=0：**全部清掉**——包括新集合里仍存在的通道。换主板后通道号含义全变，
+  #           旧「机箱风扇」可能落到新板子的 CPU 插针上，留着名字就是张冠李戴。
+  #           名字与模式是用户资产，所以清之前必须由用户明确选择（界面会问）。
+  local pruned=""
+  if [ "$keep" != "1" ]; then
+    local k num
+    for k in $(sed -n 's/^\(FAN[0-9]\+\)_.*/\1/p;s/^\(SHOW_FANCH_[0-9]\+\)=.*/\1/p' "$CONF" 2>/dev/null | sort -u); do
+      case "$k" in
+        FAN*)         num=$(printf '%s' "$k" | sed 's/^FAN\([0-9]\+\)$/\1/') ;;
+        SHOW_FANCH_*) num=$(printf '%s' "$k" | sed 's/^SHOW_FANCH_\([0-9]\+\)$/\1/') ;;
+        *) continue ;;
+      esac
+      [ -n "$num" ] || continue
+      if [ "${k#SHOW_FANCH_}" != "$k" ]; then
+        sed -i "/^SHOW_FANCH_${num}=/d" "$CONF" 2>/dev/null
+      else
+        sed -i "/^FAN${num}_/d" "$CONF" 2>/dev/null
+      fi
+      pruned="$pruned $k"
+    done
+  fi
+
+  local prev; prev=$(scan_hwid)
+  mkdir -p "$(dirname "$FAN_REGISTRY")"
+  {
+    printf 'SCAN_HWID=%s\n' "$sig"
+    printf 'SCAN_CHIP=%s\n' "$chosenname"
+    printf 'SCAN_DIR=%s\n' "$chipdir"
+    printf 'SCAN_CHANNELS=%s\n' "$ch"
+    printf 'SCAN_TS=%s\n' "$(date +%s)"
+    printf 'SCAN_ALL=%s\n' "$allflat"
+  } > "$FAN_REGISTRY"
+
+  printf '{"hwid":"%s","chip":"%s","dir":"%s","channels":"%s","all":%s,"prev_hwid":"%s","keep":%s,"pruned":"%s"}\n' \
+    "$sig" "$chosenname" "$chipdir" "$ch" "$(scan_all_json "$allflat")" "$prev" "$keep" "$(printf '%s' "$pruned" | sed 's/^ //')"
+}
+
+# 探测缓存是否过期（硬件变了）
+fan_scan_stale() {
+  local cur old
+  cur=$(hwid); old=$(scan_hwid)
+  [ -z "$old" ] && return 0
+  [ "$cur" != "$old" ] && return 0
+  return 1
+}
+
+# 硬件有变化（或从未探测）时自动重探，并重置基线
+fan_ensure_scan() {
+  need_root
+  [ -r "$FAN_REGISTRY" ] || { cmd_fan_rescan >/dev/null 2>&1; return 0; }
+  if fan_scan_stale; then
+    local old; old=$(scan_hwid)
+    mkdir -p "$FANBASE"
+    # 旧基线按时间戳留存，不删 —— 万一要回退还能查
+    mv -f "$FANBASE" "$FANBASE.old-$(date +%s)" 2>/dev/null
+    cmd_fan_rescan >/dev/null 2>&1
+    printf '风扇硬件已变化（%s → %s），已重新探测并重置原值基线；旧基线留存为 fan-baseline.old-*。\n' \
+      "$old" "$(scan_hwid)" >&2
+  fi
+  return 0
 }
 
 fan_rpm()  { local d; d=$(nct_dir) || { printf '0'; return; }; cat "$d/fan${1}_input" 2>/dev/null || printf '0'; }
@@ -620,6 +806,7 @@ valid_pwm() {
 
 # 施加单个通道
 fan_apply_one() {   # $1=通道号
+  fan_ensure_scan
   local n="$1" d; d=$(nct_dir) || return 0
   local var="FAN${n}"
   local mode; eval "mode=\${${var}_MODE:-off}"
@@ -924,12 +1111,13 @@ emit_status() {
   je="${je%,}"
   local base; base=$(base_khz)
   cat <<EOF
-{"show_cpu_temp":$SHOW_CPU_TEMP,"show_fan":$SHOW_FAN,"show_disk":$SHOW_DISK,"show_cpu_freq":$SHOW_CPU_FREQ,"block_subscription":$BLOCK_SUBSCRIPTION_PROMPT,"governor":"$CPU_GOVERNOR","governors":[$jg],"freq_min":$CPU_FREQ_MIN,"freq_max":$CPU_FREQ_MAX,"governor_live":"$(live_gov)","freq_min_live":$(( $(live_min) / 1000 )),"freq_max_live":$(( $(live_max) / 1000 )),"freq_cur":$(( $(live_cur) / 1000 )),"freq_hw_min":$(( $(hw_min_khz) / 1000 )),"freq_hw_max":$(( $(hw_max_khz) / 1000 )),"base_freq":$(( base / 1000 )),"turbo":$(turbo_get),"turbo_avail":$(turbo_avail),"epp":"$(epp_cur)","epp_avail":$(epp_avail),"epp_list":[$je],"driver":"$(cpudriver)","amd_pstate":"$(apstate_status)","policies":$(policies | wc -l),"cpufreq_ok":$(cpufreq_ok && echo 1 || echo 0),"cpu_brand":"$(cpu_brand)","cpu_gen":"$(cpu_gen)","cpu_vendor":"$(cpu_vendor)","apt_mirror":"$APT_MIRROR","apt_mirror_live":"$(if [ -x "$MIRROR" ]; then "$MIRROR" status 2>/dev/null | sed -n 's/.*"apt_mirror_detected":"\([^"]*\)".*/\1/p'; fi)","mirror_list":"$(if [ -x "$MIRROR" ]; then "$MIRROR" list 2>/dev/null | awk '/^  [a-z]/ {print $1}' | tr '\n' ','; fi)","apt_mirror_avail":$([ -x "$MIRROR" ] && echo true || echo false),"fan_avail":$([ -n "$(nct_dir)" ] && echo true || echo false),"fan_channels":"$(fan_channels | tr ' ' ',')","fans":$(fan_status_json),"fan_sources":$(fan_sources_json),"fan_pwm_min":$FAN_PWM_MIN,"config_file":"$CONF"}
+{"show_cpu_temp":$SHOW_CPU_TEMP,"show_fan":$SHOW_FAN,"show_disk":$SHOW_DISK,"show_cpu_freq":$SHOW_CPU_FREQ,"block_subscription":$BLOCK_SUBSCRIPTION_PROMPT,"governor":"$CPU_GOVERNOR","governors":[$jg],"freq_min":$CPU_FREQ_MIN,"freq_max":$CPU_FREQ_MAX,"governor_live":"$(live_gov)","freq_min_live":$(( $(live_min) / 1000 )),"freq_max_live":$(( $(live_max) / 1000 )),"freq_cur":$(( $(live_cur) / 1000 )),"freq_hw_min":$(( $(hw_min_khz) / 1000 )),"freq_hw_max":$(( $(hw_max_khz) / 1000 )),"base_freq":$(( base / 1000 )),"turbo":$(turbo_get),"turbo_avail":$(turbo_avail),"epp":"$(epp_cur)","epp_avail":$(epp_avail),"epp_list":[$je],"driver":"$(cpudriver)","amd_pstate":"$(apstate_status)","policies":$(policies | wc -l),"cpufreq_ok":$(cpufreq_ok && echo 1 || echo 0),"cpu_brand":"$(cpu_brand)","cpu_gen":"$(cpu_gen)","cpu_vendor":"$(cpu_vendor)","apt_mirror":"$APT_MIRROR","apt_mirror_live":"$(if [ -x "$MIRROR" ]; then "$MIRROR" status 2>/dev/null | sed -n 's/.*"apt_mirror_detected":"\([^"]*\)".*/\1/p'; fi)","mirror_list":"$(if [ -x "$MIRROR" ]; then "$MIRROR" list 2>/dev/null | awk '/^  [a-z]/ {print $1}' | tr '\n' ','; fi)","apt_mirror_avail":$([ -x "$MIRROR" ] && echo true || echo false),"fan_avail":$([ -n "$(fan_chip_dir)" ] && echo true || echo false),"fan_channels":"$(fan_channels | tr ' ' ',')","fan_chip":"$(cat "$(fan_chip_dir)/name" 2>/dev/null)","fan_hwid":"$(hwid)","fan_scan_ts":$(scan_get 'SCAN_TS' 0),"fan_all":$(scan_all_json),"fans":$(fan_status_json),"fan_sources":$(fan_sources_json),"fan_pwm_min":$FAN_PWM_MIN,"config_file":"$CONF"}
 EOF
 }
 
 # ---------- 命令 ----------
 cmd_status() { emit_status; }
+  fan_ensure_scan
 
 cmd_set() {
   need_root
@@ -1034,5 +1222,7 @@ case "${1:-status}" in
     fan-detect) cmd_fan_detect ;;
     fan-bind) cmd_fan_bind ;;
     fan-bind-progress) cat /run/pve-hwtools-fanbind.json 2>/dev/null || printf '{"state":"idle"}\n' ;;
-    *) die "用法：pve-hwtools-agent {status|set k=v...|apply|mirrors|fan-test N|fan-detect|fan-bind|fan-bind-progress}" ;;
+    fan-rescan) shift; cmd_fan_rescan "${1:-0}" ;;
+    fan-scan)   cat "$FAN_REGISTRY" 2>/dev/null || printf 'SCAN_HWID=(未探测)\n' ;;
+    *) die "用法：pve-hwtools-agent {status|set k=v...|apply|mirrors|fan-test N|fan-detect|fan-bind|fan-bind-progress|fan-rescan [keep=0/1]|fan-scan}" ;;
 esac

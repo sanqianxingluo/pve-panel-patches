@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V2.8
+# 版本：V2.9
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -610,6 +610,37 @@ __PACKAGE__->register_method({
         return $res;
     },
 });
+__PACKAGE__->register_method({
+    name => 'hwfanrescan',
+    path => 'hwfan-rescan',
+    method => 'POST',
+    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Modify']] },
+    description => "重新探测风扇硬件：按能力重找可控芯片与 pwm 通道，并重置原值基线。换主板后用。",
+    proxyto => 'node',
+    # protected => 1：探测要遍历 sysfs（需 root），pveproxy 会降权执行，必须回宿主跑。
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            keep => { type => 'boolean', default => 0, optional => 1 },
+        },
+    },
+    returns => { type => 'object', properties => {} },
+    code => sub {
+        my ($param) = @_;
+        my $out = '';
+        eval {
+            run_command(['/usr/local/bin/pve-hwtools-agent', 'fan-rescan',
+                         ($param->{keep} ? '1' : '0')],
+                        outfunc => sub { $out .= shift });
+        };
+        die "重新扫描失败：$@\n" if $@;
+        my $res = {};
+        eval { $res = decode_json($out) };
+        return $res;
+    },
+});
 # PVE_HWAPI:END
 '''
 s = s.replace(a2, api, 1)
@@ -1140,10 +1171,10 @@ Ext.define('PVE.node.HwTools', {
                                 { xtype: 'button', text: gettext('自动识别风扇'),
                                   iconCls: 'fa fa-magic', width: 148,
                                   handler: function () { me.fanBind(); } },
-                                { xtype: 'button', text: gettext('重新扫描通道'),
-                                  iconCls: 'fa fa-refresh', width: 136,
+                                { xtype: 'button', text: gettext('重新识别芯片与通道'),
+                                  iconCls: 'fa fa-refresh', width: 186,
                                   margin: '0 0 0 8',
-                                  handler: function () { me.reload(); } },
+                                  handler: function () { me.fanRescan(); } },
                             ],
                         },
                     ],
@@ -1299,6 +1330,62 @@ Ext.define('PVE.node.HwTools', {
                 fs.add(crow);
 
                 me.fanSyncRow(n);
+            });
+        },
+
+        // 换主板后重探：按能力重找可控芯片与 pwm 通道（不写死型号）。
+        // 必须先问清要不要保留通道名——新板子的通道号可能完全不同，
+        // 留着旧名字会张冠李戴（旧「机箱风扇」可能落到新板子的 CPU 插针上）。
+        fanRescan: function () {
+            var me = this;
+            Ext.Msg.show({
+                title: gettext('重新识别芯片与通道'),
+                msg: gettext('将重新扫描本机的风扇控制芯片与 pwm 通道。换主板后请点这里。<br/><br/>'
+                    + '换主板时通道号往往会变，旧名字可能张冠李戴 —— 是否保留现有的通道名与显示设置？'),
+                buttons: Ext.Msg.YESNOCANCEL,
+                buttonText: {
+                    yes: gettext('保留名字'),
+                    no: gettext('清空名字'),
+                    cancel: gettext('取消'),
+                },
+                icon: Ext.Msg.QUESTION,
+                fn: function (btn) {
+                    if (btn === 'cancel') { return; }
+                    var keep = (btn === 'yes') ? 1 : 0;
+                    me.setLoading(gettext('正在重新扫描…'));
+                    Proxmox.Utils.API2Request({
+                        url: '/nodes/' + me.nodename + '/hwfan-rescan',
+                        method: 'POST',
+                        params: { keep: keep },
+                        success: function (response) {
+                            me.setLoading(false);
+                            var d = response.result.data || {};
+                            var lines = [];
+                            (d.all || []).forEach(function (c) {
+                                lines.push(c.dir + '  ' + c.name + '  ' +
+                                    (c.channels ? (gettext('通道 ') + c.channels) : gettext('无 pwm 通道')));
+                            });
+                            var head = d.chip
+                                ? (gettext('已识别风扇芯片：') + d.chip + gettext('，可控通道 ') + d.channels + '。')
+                                : gettext('未找到任何可控风扇通道（本机可能没有 Super I/O 或驱动未加载）。');
+                            var extra = '';
+                            if (d.prev_hwid && d.prev_hwid !== d.hwid && d.prev_hwid !== 'none') {
+                                extra += '<br/><span style="color:#a60">' + gettext('检测到硬件已变化：')
+                                    + d.prev_hwid + ' → ' + d.hwid + gettext('，原值基线已重置。') + '</span>';
+                            }
+                            if (d.pruned) {
+                                extra += '<br/>' + gettext('已清理不再存在的通道配置：') + d.pruned;
+                            }
+                            Ext.Msg.alert(gettext('扫描完成'), head +
+                                (lines.length ? ('<br/><br/>' + lines.join('<br/>')) : '') + extra);
+                            me.reload();
+                        },
+                        failure: function (response) {
+                            me.setLoading(false);
+                            Ext.Msg.alert(gettext('扫描失败'), response.htmlStatus);
+                        },
+                    });
+                },
             });
         },
 
@@ -1519,8 +1606,9 @@ Ext.define('PVE.node.HwTools', {
                            gettext('（配置为 ') + (d.apt_mirror || '?') + gettext('）'))
                         : gettext('本机未装镜像切换脚本')) + '<br/>' +
                     gettext('风扇：') + (d.fan_avail
-                        ? (gettext('通道 ') + d.fan_channels + gettext('，本机可控'))
-                        : gettext('本机无可控风扇通道')) +
+                        ? ((d.fan_chip ? (d.fan_chip + '（' + (d.fan_dir || '') + '）· ') : '') +
+                           gettext('通道 ') + d.fan_channels + gettext('，本机可控'))
+                        : gettext('本机未识别到可控风扇通道（可点「重新识别芯片与通道」重试）')) +
                     '</span>'
                 );
             },
