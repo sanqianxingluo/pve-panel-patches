@@ -16,6 +16,7 @@
 #   /usr/local/bin/pve-hwpatch.sh      概要硬件信息 + PVE 工具集设置页（打补丁）
 #   /usr/local/bin/pve-hwtools-agent   状态代理（配置读写 / 调频 / 重渲染）
 #   /usr/local/bin/pve-nosub-patch.sh  订阅提示屏蔽（双向可逆）
+#   /usr/local/bin/pve-mirror-switch.sh 软件源镜像切换（Debian / Proxmox）
 #   /etc/apt/apt.conf.d/98-pve-hwpatch       apt 钩子：升级后自动重打
 #   /etc/apt/apt.conf.d/99-pve-nosub-patch   apt 钩子：同上
 # 由 pve-hwpatch.sh 自行落盘（无需手工放）：
@@ -26,7 +27,7 @@ set -u
 
 REPO="sanqianxingluo/pve-panel-patches"
 REF="${PVE_HWTOOLS_REF:-main}"
-FILES="pve-hwpatch.sh pve-hwtools-agent pve-nosub-patch.sh"
+FILES="pve-hwpatch.sh pve-hwtools-agent pve-nosub-patch.sh pve-mirror-switch.sh"
 DEST=/usr/local/bin
 HWDEST=/usr/local/lib/pve-hwtools
 BK=/root/pve-upgrade-backup
@@ -154,7 +155,7 @@ PY
   fi
 
   say "[5] 删除补丁文件"
-  rm -f "$DEST/pve-hwpatch.sh" "$DEST/pve-hwtools-agent" "$DEST/pve-nosub-patch.sh"
+  rm -f "$DEST/pve-hwpatch.sh" "$DEST/pve-hwtools-agent" "$DEST/pve-nosub-patch.sh" "$DEST/pve-mirror-switch.sh"
   rm -f /usr/bin/s.sh
   rm -rf "$HWDEST"
   find /usr/share/pve-manager /usr/share/perl5 -name '*.orig.hwpatch' -delete 2>/dev/null || true
@@ -269,6 +270,7 @@ chk() { if eval "$2" >/dev/null 2>&1; then say "✅ $1"; else say "❌ $1"; FAIL
 chk "补丁脚本就位"        "[ -x $DEST/pve-hwpatch.sh ]"
 chk "状态代理就位"        "[ -x $DEST/pve-hwtools-agent ]"
 chk "订阅屏蔽脚本就位"    "[ -x $DEST/pve-nosub-patch.sh ]"
+chk "镜像切换脚本就位"    "[ -x $DEST/pve-mirror-switch.sh ]"
 chk "取样脚本 /usr/bin/s.sh 就位" "[ -f /usr/bin/s.sh ]"
 chk "CPU 世代映射就位"    "[ -f $HWDEST/cpu-model.sh ]"
 chk "配置 /etc/default/pve-hwtools 就位" "[ -f /etc/default/pve-hwtools ]"

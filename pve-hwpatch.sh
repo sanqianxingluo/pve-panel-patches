@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V2.2
+# 版本：V2.3
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -35,6 +35,7 @@ N=/usr/share/perl5/PVE/API2/Nodes.pm
 SH=/usr/bin/s.sh
 CPUDBDIR=/usr/local/lib/pve-hwtools
 CPUDB="$CPUDBDIR/cpu-model.sh"
+MIRROR=/usr/local/bin/pve-mirror-switch.sh
 BK=/root/pve-upgrade-backup
 mkdir -p "$BK"
 changed=0
@@ -63,10 +64,21 @@ CPU_FREQ_MAX=3800
 CPU_TURBO=1
 # 能效偏好 EPP（仅部分新平台支持）
 CPU_EPP=balance_performance
+#
+# 软件源镜像：ustc 中科大 / tuna 清华 / aliyun 阿里云 / tencent 腾讯云 / huawei 华为云 / official 官方源
+APT_MIRROR=ustc
 EOC
   chmod 644 "$CONF"; changed=1; echo "  [0] 已建 $CONF"
 else
   echo "  [0] $CONF 已存在，保留"
+  # 升级迁移：老配置里没有的键补上（幂等；只加不改，绝不覆盖用户已设的值）
+  for kv in "APT_MIRROR=ustc"; do
+    k="${kv%%=*}"
+    if ! grep -qE "^[[:space:]]*$k=" "$CONF"; then
+      printf '\n# 软件源镜像（ustc 中科大 / tuna 清华 / aliyun 阿里云 / tencent 腾讯云 / huawei 华为云 / official 官方源）\n%s\n' "$kv" >> "$CONF"
+      changed=1; echo "  [0] 已补默认项 $k 到 $CONF"
+    fi
+  done
 fi
 
 # ---------- 0b) 订阅提示屏蔽：按配置执行（可屏蔽、可恢复）----------
@@ -906,6 +918,31 @@ Ext.define('PVE.node.HwTools', {
                     items: [mkCb('屏蔽「无有效订阅」登录弹窗', 'block_subscription')],
                 },
                 {
+                    xtype: 'fieldset',
+                    title: gettext('软件源'),
+                    defaults: { margin: '4 0' },
+                    items: [
+                        {
+                            xtype: 'combo',
+                            fieldLabel: gettext('Debian / PVE 镜像'),
+                            name: 'apt_mirror',
+                            editable: false,
+                            forceSelection: true,
+                            queryMode: 'local',
+                            displayField: 'v',
+                            valueField: 'val',
+                            emptyText: gettext('本机无切换脚本'),
+                            store: { fields: ['v', 'val'], data: [] },
+                        },
+                        {
+                            xtype: 'component',
+                            itemId: 'mirrorhint',
+                            margin: '6 0 0 0',
+                            html: '',
+                        },
+                    ],
+                },
+                {
                     xtype: 'container',
                     layout: 'hbox',
                     margin: '14 0 0 0',
@@ -965,6 +1002,17 @@ Ext.define('PVE.node.HwTools', {
                 var cbTurbo = me.down('combo[name=turbo]');
                 cbTurbo.setDisabled(!d.turbo_avail);
 
+                // 软件源镜像：候选来自切换脚本自报的一览（含中文显示名）
+                var cbMir = me.down('combo[name=apt_mirror]');
+                var mirNames = {'ustc': gettext('中科大'), 'tuna': gettext('清华大学'),
+                                'aliyun': gettext('阿里云'), 'tencent': gettext('腾讯云'),
+                                'huawei': gettext('华为云'), 'official': gettext('官方源')};
+                var mirList = d.mirror_list ? String(d.mirror_list).split(',').filter(function (x) { return x; }) : [];
+                cbMir.getStore().loadData(mirList.map(function (m) {
+                    return { v: (mirNames[m] ? mirNames[m] + '（' + m + '）' : m), val: m };
+                }));
+                cbMir.setDisabled(!d.apt_mirror_avail || !mirList.length);
+
                 // 数字框的合法范围也须在 setValues 之前设好，否则被当作越界而清空。
                 // 单位一律 MHz（状态接口已折算好）。
                 var nfMin = me.down('numberfield[name=freq_min]');
@@ -985,6 +1033,7 @@ Ext.define('PVE.node.HwTools', {
                     freq_max: parseInt(d.freq_max, 10),
                     turbo: String(d.turbo),
                     epp: d.epp,
+                    apt_mirror: d.apt_mirror,
                 });
 
                 var mhz = function (v) { return v + ' MHz'; };
@@ -1002,7 +1051,11 @@ Ext.define('PVE.node.HwTools', {
                         '，' + gettext('当前 ') + mhz(d.freq_cur) + '<br/>' +
                     gettext('Turbo：') + (d.turbo_avail ? (String(d.turbo) === '1' ? gettext('启用') : gettext('关闭')) : gettext('本机不支持')) +
                         (d.epp_avail ? ('，' + gettext('EPP：') + (d.epp || '-')) : '') + '<br/>' +
-                    gettext('配置文件：') + d.config_file +
+                    gettext('配置文件：') + d.config_file + '<br/>' +
+                    gettext('软件源：') + (d.apt_mirror_avail
+                        ? (gettext('当前文件为 ') + (d.apt_mirror_live || '?') +
+                           gettext('（配置为 ') + (d.apt_mirror || '?') + gettext('）'))
+                        : gettext('本机未装镜像切换脚本')) +
                     '</span>'
                 );
             },
@@ -1040,6 +1093,11 @@ Ext.define('PVE.node.HwTools', {
         if (cbEpp && !cbEpp.isDisabled() && val.epp) {
             kv.push('epp=' + val.epp);
         }
+        // 软件源：仅当本机装了切换脚本且确有选择时才提交
+        var cbMir = me.down('combo[name=apt_mirror]');
+        if (cbMir && !cbMir.isDisabled() && val.apt_mirror) {
+            kv.push('apt_mirror=' + val.apt_mirror);
+        }
         kv = kv.join(',');
 
         Proxmox.Utils.API2Request({
@@ -1052,7 +1110,7 @@ Ext.define('PVE.node.HwTools', {
                 PVE.HW.refreshPending = true;
                 Ext.Msg.show({
                     title: gettext('已保存'),
-                    msg: gettext('设置已写入并生效。概要页会在下一次刷新时按新开关显示。'),
+                    msg: gettext('设置已写入并生效。软件源若已变更则同步切换；概要页会在下一次刷新时按新开关显示。'),
                     buttons: Ext.Msg.OK,
                     icon: Ext.Msg.INFO,
                 });
@@ -1117,6 +1175,12 @@ if [ -f "$CPUDB" ]; then
   echo "  [4] $CPUDB 就位（CPU 世代映射，s.sh 与 agent 共用）"
 else
   echo "  [4] 警告：$CPUDB 缺失，CPU 代号将退化为 family/model" >&2
+fi
+# 镜像切换脚本：缺失只影响「软件源」那一项，其余功能照常
+if [ -x "$MIRROR" ]; then
+  echo "  [4] $MIRROR 就位（软件源镜像切换）"
+else
+  echo "  [4] 提示：$MIRROR 不存在，界面上的「软件源」一项将不可用" >&2
 fi
 
 # ---------- 5) 开机自启：施加调频 + 重渲染 ----------

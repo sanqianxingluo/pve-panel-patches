@@ -1,6 +1,6 @@
 # Proxmox VE 面板补丁集
 
-> **当前版本：V2.2** · 发布于 2026-09-24
+> **当前版本：V2.3** · 发布于 2026-09-24
 
 自用的 PVE Web 界面增强补丁，纯 shell，无第三方依赖（除系统已有的 python3 / lm-sensors）。
 
@@ -12,7 +12,8 @@
 | `pve-hwpatch.sh` | 概要页硬件信息 + 「PVE 工具集」设置页 + 注入后端 API |
 | `pve-hwtools-agent` | 状态代理：读写配置、施加 CPU 调频、触发界面重渲染 |
 | `pve-nosub-patch.sh` | 按配置屏蔽 / 恢复「无有效订阅」弹窗（双向可逆） |
-| `SHA256SUMS` | 四个脚本的校验和（`install.sh` 下载后会自动核对） |
+| `pve-mirror-switch.sh` | 软件源镜像一键切换（Debian / Proxmox，六种镜像） |
+| `SHA256SUMS` | 五个脚本的校验和（`install.sh` 下载后会自动核对） |
 
 ### `pve-hwpatch.sh` —— 节点概要显示硬件信息
 
@@ -28,7 +29,7 @@
 
 PVE 原生界面不显示这些；此前常用 pvetools 的 `chSensors` 实现，但**每次 `pve-manager` 升级都会把补丁覆盖掉**，于是概要信息就「消失」了。本脚本改成**幂等 + 可自愈**的写法。
 
-### 「PVE 工具集」设置页 —— 图形化开关与 CPU 调频
+### 「PVE 工具集」设置页 —— 图形化开关、CPU 调频与软件源
 
 在节点左菜单（**System → PVE 工具集**）新增一页，三组：
 
@@ -52,6 +53,7 @@ CPU_FREQ_MIN=800          # 单位 MHz
 CPU_FREQ_MAX=3800         # 单位 MHz
 CPU_TURBO=1               # Turbo 加速：1 启用 / 0 关闭
 CPU_EPP=balance_performance   # 能效偏好（仅部分平台）
+  APT_MIRROR=ustc               # 软件源镜像（ustc/tuna/aliyun/tencent/huawei/official）
 ```
 
 #### 它改了什么
@@ -175,7 +177,52 @@ pvesh get /nodes/<节点名>/hwtools --output-format json
 9. **注入块里别写反斜杠转义——包括注释。**
    前端 JS 是嵌在补丁脚本内 Python 三引号字符串里的；写了反斜杠加 `n` / `u` / `t` 之类，Python 会**先**把它译成真字符，从而截断 JS 字面量或注释，结果整个 `pvemanagerlib.js` 加载失败、连登录窗都不渲染。换行用 HTML 标签（`<br/>`）或 `String.fromCharCode`，度数符号直接写 `°`。脚本内已加护栏：一旦在注入块源码里发现反斜杠转义就拒绝注入、保持原文件不动。
 
+## 软件源镜像切换
+
+面板「PVE 工具集」页的**软件源**分组里可选择 Debian / Proxmox 的软件源镜像；命令行亦可用：
+
+```bash
+pve-mirror-switch.sh list              # 列出全部镜像及各自地址
+pve-mirror-switch.sh status            # 显示当前镜像（JSON）
+pve-mirror-switch.sh set tuna          # 切换（只改写源文件，不做连通性检查）
+pve-mirror-switch.sh probe             # 探测各镜像当前可达性（查询用）
+```
+
+支持：`ustc` 中科大 / `tuna` 清华 / `aliyun` 阿里云 / `tencent` 腾讯云 / `huawei` 华为云 / `official` 官方源。
+
+**设计取舍（重要）**
+
+- **切换本身不做连通性检查。** 只负责改写源文件；镜像通不通由用户判断，随时 `apt-get update` 自测。镜像可达性会随时间波动，把它当作切换成功与否的判据，会让切换动不动就失败回滚。
+- **只改认得出的公共镜像。** 自家内网仓库等自定义源**原样保留**，绝不改动。
+- **发行版代号现读** `/etc/os-release`，不写死 `trixie`——将来 PVE 换到 `forky` 无需改脚本。
+- 无订阅时自动**停用企业订阅源**（`pve-enterprise.sources` → `.disabled`，原件备份在 `/root/pve-upgrade-backup/`），否则 `apt update` 每次报 401。
+- 首次接管前，原始源文件整份存 `/usr/local/lib/pve-hwtools/apt-sources.orig/`（**永不覆盖**）；每次改动另存时间戳快照 `/root/pve-upgrade-backup/apt-sources-<时间>/`，随时可手工回退。
+
+**实测的镜像支持面**（2026-09-24，trixie）
+
+| 镜像 | Debian | Debian 安全 | Proxmox |
+|---|---|---|---|
+| 中科大 | ✅ | ✅ | ✅ |
+| 清华大学 | ✅ | ✅ | ✅ |
+| 阿里云 | ✅ | ✅ | ✗ 无 `/proxmox/` 路径 |
+| 腾讯云 | ✅ | ✅ | ✗ 无 `/proxmox/` 路径 |
+| 华为云 | ✅ | ✅ | ✗ 索引签名无效，apt 拒用 |
+| 官方源 | ✅ | ✅ | ✅（国内访问较慢） |
+
+阿里云、腾讯云、华为云的 **PVE 包走官方源**（Debian 部分仍走本地镜像，照样快）——它们的 Proxmox 镜像要么不存在、要么坏了，这是踩过才知道的事。
+
 ## 更新日志
+
+### V2.3 · 2026-09-24
+- **新增 `pve-mirror-switch.sh`：软件源镜像一键切换**，并在「PVE 工具集」页加「软件源」分组；支持中科大 / 清华 / 阿里云 / 腾讯云 / 华为云 / 官方源六种
+  - 只改公共镜像的源行，**自定义私有源原样保留**（内网仓库不会被误改）
+  - 发行版代号现读 `os-release`，不写死 `trixie`
+  - 自动停用企业订阅源；原件存 `apt-sources.orig`（永不覆盖）+ 每次改动留时间戳快照
+  - 支持经典 `sources.list` / `*.list` 与 deb822 `*.sources` 两种格式
+  - **切换不做连通性检查**——只改写源文件，是否可达由用户 `apt-get update` 自测
+- 实测结论：阿里云、腾讯云**无 Proxmox 镜像**（404），华为云的 Proxmox 镜像**签名无效**（apt 报 `Clearsigned file isn't valid`）→ 这三家的 PVE 包走官方源
+- 老配置自动补 `APT_MIRROR` 默认项（幂等，不覆盖用户已设的值）
+
 
 ### V2.2 · 2026-09-24
 - **新增 `install.sh` 一键部署 / 卸载脚本**：自动装依赖、放脚本、挂 apt 钩子、结尾自检；`--uninstall` 完整还原
