@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V2.14
+# 版本：V2.15
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -480,7 +480,7 @@ __PACKAGE__->register_method({
             # 值的字符类**必须允许下划线**：EPP 档位名形如 balance_performance。
             # 只允许字母数字下划线点减号，杜绝 shell 元字符——防注入的同时不误伤合法取值。
             # 值的字符类必须允许：下划线（EPP 档位名 balance_performance）、
-            # 冒号与逗号（风扇曲线 25:30,30:60,45:120,60:200,80:255）。
+            # 冒号与逗号（风扇曲线 25:12,30:24,45:47,60:78,80:100）。
             # 仍只允许字母数字下划线点减号冒号逗号，杜绝 shell 元字符——防注入且不误伤合法取值。
             # 键名必须允许**数字**：风扇配置项形如 fan1_mode / fan3_curve。
             # 曾经只写 [a-z_]+，于是 fan1_mode 一律被判非法、保存永远失败。
@@ -1376,7 +1376,7 @@ Ext.define('PVE.node.HwTools', {
             if (hint) {
                 hint.setHtml('<span style="color:#888">' +
                     (fans.length
-                        ? (gettext('共 ') + fans.length + gettext(' 个通道。自动 = 交给主板硬件按曲线调速（无需常驻程序）；手动 = 固定占空比。曲线五点须按温度由低到高。') +
+                        ? (gettext('共 ') + fans.length + gettext(' 个通道。自动 = 交给主板硬件按曲线调速（无需常驻程序）；手动 = 固定占空比。占空比一律填百分比（1~100%）。曲线五点须按温度由低到高。') +
                            '<br/>' + gettext('「跟哪路温度」决定该通道随哪一路温度升降 —— CPU 风扇选「CPU 核心温度」，机箱风扇可跟「主板温度」。括号里的数值是当前读数。') +
                            '<br/>' + gettext('模式为「关闭（用主板设置）」时，该列显示的是主板当前实际在跟的温度源；要改需先切到「自动曲线」。'))
                         : gettext('本机未检测到可控风扇通道。')) + '</span>');
@@ -1393,7 +1393,7 @@ Ext.define('PVE.node.HwTools', {
                     var kv = String(x).split(':');
                     if (kv.length === 2) { cpts.push({ t: parseInt(kv[0], 10), w: parseInt(kv[1], 10) }); }
                 });
-                while (cpts.length < 5) { cpts.push({ t: 30 + cpts.length * 10, w: 64 + cpts.length * 48 }); }
+                while (cpts.length < 5) { cpts.push({ t: 30 + cpts.length * 10, w: 12 + cpts.length * 22 }); }
 
                 fs.add(Ext.create('Ext.container.Container', {
                     itemId: 'fanrow' + n,
@@ -1414,8 +1414,10 @@ Ext.define('PVE.node.HwTools', {
                           value: f.mode || 'off',
                           listeners: { change: function () { me.fanSyncRow(n); } } },
                         { name: 'fan' + n + '_manual', width: 84,
-                          emptyText: gettext('占空比'), minValue: 1, maxValue: 255,
-                          value: f.manual || 128, allowBlank: false,
+                          emptyText: gettext('占空比%'), minValue: 1, maxValue: 100,
+                          // 占空比一律用百分比；内核要的 0~255 由后端换算
+                          value: (f.manual !== undefined && f.manual !== null) ? f.manual : 50,
+                          allowBlank: false,
                           listeners: { change: function () { me.fanSyncRow(n); } } },
                         { name: 'fan' + n + '_sel', xtype: 'combo', width: 232,
                           hideLabel: true, editable: false, forceSelection: true,
@@ -1454,7 +1456,7 @@ Ext.define('PVE.node.HwTools', {
                                value: x.t, hideLabel: true, margin: '0 4 0 0' });
                     crow.add({ xtype: 'component', margin: '6 4 0 0', html: '℃ →' });
                     crow.add({ xtype: 'numberfield', name: 'fan' + n + '_pt' + i + '_w',
-                               width: 58, emptyText: gettext('占空比'), minValue: 1, maxValue: 255,
+                               width: 58, emptyText: gettext('占空比%'), minValue: 1, maxValue: 100,
                                value: x.w, hideLabel: true, margin: '0 10 0 0' });
                 });
                 fs.add(crow);
@@ -1623,7 +1625,7 @@ Ext.define('PVE.node.HwTools', {
                             r = r.data || {};
                             var txt = r.moved
                                 ? (gettext('已制造明显变化：') + r.before + ' → ' + r.peak + gettext(' RPM，现已还原原状。'))
-                                : (gettext('转速未见明显变化（') + r.before + ' → ' + r.peak + gettext(' RPM）——该通道可能没接风扇，或风扇不支持调速。'));
+                                : (gettext('转速未见明显变化（') + r.before + ' → ' + r.peak + gettext(' RPM）——该通道可能没接风扇，或风扇不支持调速。（试转用的占空比：') + (r.target !== undefined ? r.target + '%' : '') + gettext('）'));
                             Ext.Msg.alert(gettext('测试完成'), txt);
                             me.reload();
                         },
