@@ -1971,15 +1971,64 @@ Ext.define('PVE.node.HwTools', {
             });
         },
 
+        // 想执行更新，要连过两道关：先确认操作，再在红色警告上点「我已知悉」。
+        // 两级都过了才真的动宿主包。
         upgRun: function (what) {
             var me = this;
             var isPve = (what === 'pve');
             var title = isPve ? gettext('更新 PVE 软件') : gettext('更新内核');
             var body = isPve
-                ? gettext('将更新 PVE 与 Debian 的软件包（<b>内核一枚都不动</b>）。<br/><br/>动手前会自动把<b>当前内核</b>保留下来（apt-mark hold），万一更新失败可一键回退。不会自动重启。<br/><br/>继续？')
+                ? gettext('将更新 PVE 与 Debian 的软件包（<b>内核一枚都不动</b>）。<br/><br/>动手前会自动把<b>当前内核</b>保留下来，万一更新失败可一键回退。不会自动重启。<br/><br/>继续？')
                 : gettext('将安装最新内核，并<b>保留当前内核</b>以便回退。装好后启动项会切到新内核，但<b>需自行重启才生效</b>。不会自动重启。<br/><br/>继续？');
             Ext.Msg.confirm(title, body, function (btn) {
                 if (btn !== 'yes') { return; }
+                // 延一拍再弹警告：Ext.Msg 是**单例**，在它自己的回调里紧接着再 show()
+                // 会让两次弹窗挤在同一个 tick 里。实测延后 150ms 稳定。
+                Ext.defer(function () { me.upgWarn(what); }, 150);
+            });
+        },
+
+        // 第二级：红色警告，必须点「我已知悉」
+        upgWarn: function (what) {
+            var me = this;
+            var isPve = (what === 'pve');
+            if (!me._dangerCss && Ext.util && Ext.util.CSS) {
+                Ext.util.CSS.createStyleSheet(
+                    '.pve-hwtools-danger .x-window-header-default { background-color:#b30000; }' +
+                    '.pve-hwtools-danger .x-window-header-default .x-title-text { color:#fff; font-weight:700; }' +
+                    '.pve-hwtools-danger .x-window-header-default .x-tool-img { filter:brightness(3); }',
+                    'pve-hwtools-danger');
+                me._dangerCss = true;
+            }
+            var w = '';
+            if (isPve) {
+                w = gettext('即将更新本机的 PVE 与 Debian 软件包。') + '<br/><br/>' +
+                    gettext('这会真实改动宿主系统：会下载并安装软件包、可能替换系统服务与内核之外的核心组件。') + '<br/>' +
+                    gettext('请确认这台主机当前没有正在做的关键操作，并已做好备份。') + '<br/><br/>' +
+                    gettext('更新期间请勿断电或强制重启。');
+            } else {
+                w = gettext('即将安装新内核，并把下一次启动切到它。') + '<br/><br/>' +
+                    gettext('这会真实改动宿主的引导：装好后<b>必须重启</b>才会用上新内核。') + '<br/>' +
+                    gettext('若你使用了核显 SR-IOV 之类的 DKMS 模块，更新后驱动需要为新内核重新编译 —— 这不在本工具处理范围内。') + '<br/><br/>' +
+                    gettext('别在更新过程中断电或强制重启。');
+            }
+            var cls = 'pve-hwtools-danger';
+            Ext.Msg.show({
+                title: gettext('警告：高风险操作'),
+                message: '<div style="color:#b30000;font-weight:600;line-height:1.65">' + w + '</div>',
+                buttons: Ext.Msg.YESNO,
+                buttonText: { yes: gettext('我已知悉'), no: gettext('取消') },
+                icon: Ext.Msg.WARNING,
+                cls: cls,
+                fn: function (btn) { if (btn === 'yes') { me.upgDo(what); } },
+            });
+        },
+
+        upgDo: function (what) {
+            var me = this;
+            var isPve = (what === 'pve');
+            var title = isPve ? gettext('更新 PVE 软件') : gettext('更新内核');
+            {
                 me.setLoading(isPve ? gettext('正在更新 PVE 软件…') : gettext('正在更新内核…'));
                 var url = '/api2/json/nodes/' + me.nodename + (isPve ? '/hwupgrade-pve-get' : '/hwupgrade-kernel-get');
                 Ext.Ajax.request({
@@ -2009,7 +2058,7 @@ Ext.define('PVE.node.HwTools', {
                         Ext.Msg.alert(title + gettext(' 失败'), response.htmlStatus);
                     },
                 });
-            });
+            }
         },
 
         upgRollback: function () {

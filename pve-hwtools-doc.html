@@ -328,6 +328,10 @@ pvesh get /nodes/&lt;节点名&gt;/hwtools --output-format json
 <td>联机刷新一次软件源索引，数出可升级的 PVE 包与内核包各多少</td>
 </tr>
 <tr>
+<td>（下面两个「更新」按钮都要过<strong>两道确认关</strong>）</td>
+<td>先弹确认操作，确认后再弹<strong>红色警告</strong>，点「我已知悉」才真正执行</td>
+</tr>
+<tr>
 <td><strong>更新 PVE 软件</strong></td>
 <td>升级 PVE 与 Debian 的软件包。<strong>内核一枚都不动</strong></td>
 </tr>
@@ -345,6 +349,15 @@ pvesh get /nodes/&lt;节点名&gt;/hwtools --output-format json
 </tr>
 </tbody>
 </table>
+<h4>两道确认关</h4>
+<p>「更新 PVE 软件」与「更新内核」都是<strong>改宿主的</strong>操作，所以做成两级确认：</p>
+<ol>
+<li><strong>确认操作</strong> —— 普通确认框，说明这次会做什么、内核怎么保。</li>
+<li><strong>红色警告</strong> —— 红色标题栏 + 红色警示文字的警告框，写明「这会真实改动宿主系统」、
+   需要重启的会写明、用到 DKMS 的会写明「不在本工具处理范围」。
+   这一步必须点 <strong>「我已知悉」</strong> 才会真的执行；点「取消」或右上角关闭都当放弃。</li>
+</ol>
+<p>只有这两关都过了，才会真正动宿主包。</p>
 <h4>回退是怎么保住的</h4>
 <p>点「更新 PVE 软件」或「更新内核」时，<strong>动手前</strong>会自动做一件事：
 把<strong>当前正在运行的那枚内核</strong>用 <code>apt-mark hold</code> 钉住，并记下它的包名。</p>
