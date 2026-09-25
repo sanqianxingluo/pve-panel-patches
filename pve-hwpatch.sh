@@ -1014,7 +1014,7 @@ Ext.define('PVE.node.HwTools', {
             if (hint) {
                 hint.setHtml('<span style="color:#888">' +
                     (fans.length
-                        ? (gettext('共 ') + fans.length + gettext(' 个通道。自动 = 交给主板硬件按曲线调速（无需常驻程序）；手动 = 固定占空比。'))
+                        ? (gettext('共 ') + fans.length + gettext(' 个通道。自动 = 交给主板硬件按曲线调速（无需常驻程序）；手动 = 固定占空比。曲线五点须按温度由低到高。'))
                         : gettext('本机未检测到可控风扇通道。')) + '</span>');
             }
             // 每次 reload 都重建：模式与曲线会变，旧控件留着会读到过期值
@@ -1076,11 +1076,9 @@ Ext.define('PVE.node.HwTools', {
                     crow.add({ xtype: 'component', margin: '6 4 0 0', html: '℃ →' });
                     crow.add({ xtype: 'numberfield', name: 'fan' + n + '_pt' + i + '_w',
                                width: 58, emptyText: gettext('占空比'), minValue: 1, maxValue: 255,
-                               value: x.w, hideLabel: true, margin: '0 12 0 0' });
+                               value: x.w, hideLabel: true, margin: '0 10 0 0' });
                 });
                 fs.add(crow);
-                fs.add({ xtype: 'component', itemId: 'fanhint' + n, margin: '0 0 6 108',
-                         html: '<span style="color:#888">' + gettext('五点须按温度由低到高；温度相同或倒序会被拒绝。') + '</span>' });
 
                 me.fanSyncRow(n);
             });
