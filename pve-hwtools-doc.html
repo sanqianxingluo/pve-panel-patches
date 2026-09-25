@@ -33,7 +33,7 @@
 <div class="pve-hwtools-doc">
 <h1>Proxmox VE 面板补丁集</h1>
 <blockquote>
-<p><strong>当前版本：V2.13</strong> · 发布于 2026-09-25
+<p><strong>当前版本：V2.14</strong> · 发布于 2026-09-25
 适用：<strong>Proxmox VE 9.x</strong>（在 <code>pve-manager</code> 9.2.20 上实测通过）· 需 root</p>
 </blockquote>
 <p>给 PVE 原生 Web 界面补上它不显示的东西：<strong>节点概要的硬件信息</strong>、
@@ -787,5 +787,18 @@ pve-hwtools-agent fan-rescan 1   # 重扫 + 保留名字与显示设置
 apt 钩子没挂上。检查 <code>apt-config dump | grep -i post-invoke</code>，
 或升级后手工跑一次 <code>/usr/local/bin/pve-hwpatch.sh</code>。
 若锚点失配（PVE 改了 <code>StatusView</code> 结构），脚本会自己报错并回滚，不会把面板改坏。</p>
+<p><strong>Q：换了主板 / 重新识别后通道数变了，界面会跟着变吗？</strong></p>
+<p>会。界面<strong>完全由探测结果驱动</strong>，没有任何写死的通道数量：</p>
+<ul>
+<li>通道清单是每次读取时<strong>实时扫 <code>hwmon</code></strong> 得到的（本机就跳过了 6，只报 <code>1,2,3,4,5,7</code>）</li>
+<li>设置页每次都<strong>先清空再按探测结果重建</strong>全部通道行，所以通道从 6 变 10 就显示 10 行</li>
+<li>配置键也是随通道号生成的（<code>FAN8_*</code>、<code>SHOW_FANCH_10=…</code> 都接受），不会卡在 7</li>
+<li>通道号<strong>按数字排序</strong>（1,2,…,9,10），不会出现「1,10,2,3」这种字典序</li>
+</ul>
+<p>换主板后点「重新识别芯片与通道」即可；它会问你要不要保留通道名（新板子上通道号含义
+往往全变，留旧名字容易张冠李戴），并重存原值基线。</p>
+<p><strong>Q：为什么概要页显示的平均核心温度是 <code>-</code>？</strong>
+<code>sensors</code> 没有输出核心温度行（驱动没暴露 <code>Core N:</code> / <code>CPU N:</code>）。<code>sensors-detect --auto</code>
+后一般就有了。</p>
 <hr>
 </div>

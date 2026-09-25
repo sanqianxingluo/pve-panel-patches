@@ -1,5 +1,5 @@
 #!/bin/bash
-# pve-hwtools-agent —— PVE 工具集状态代理（V2.13）
+# pve-hwtools-agent —— PVE 工具集状态代理（V2.14）
 #
 # 唯一的配置真相：/etc/default/pve-hwtools
 # 职责：读/写该配置；施加 CPU 调频；按配置触发界面重渲染。
@@ -221,14 +221,18 @@ fan_dir_usable() {
 
 # 某个 hwmon 目录的通道指纹：形如 "1,2,3,4,5,7"
 fan_dir_fingerprint() {
-  local d="$1" f b n out=""
-  for f in "$d"/pwm[0-9]*; do
-    [ -e "$f" ] || continue
-    b=$(basename "$f"); n=${b#pwm}
-    case "$n" in ''|*[!0-9]*) continue ;; esac
-    case " $out " in *" $n "*) ;; *) out="$out $n" ;; esac
-  done
-  printf '%s' "$(printf '%s' "${out# }" | tr ' ' ',')"
+    local d="$1" f b n out=""
+    for f in "$d"/pwm[0-9]*; do
+      [ -e "$f" ] || continue
+      b=$(basename "$f"); n=${b#pwm}
+      case "$n" in ''|*[!0-9]*) continue ;; esac
+      case " $out " in *" $n "*) ;; *) out="$out $n" ;; esac
+    done
+    # 必须**按数字**排序。shell 的 glob 展开是字典序，通道号上两位数就会露馅：
+    # 1..10 会排成 "1 10 2 3 …"，界面于是把「通道 10」排在「通道 1」后面，
+    # hwid 指纹也跟着变得难看。sort -n 之后才是 1,2,…,10。
+    [ -n "$out" ] || { printf ''; return 0; }
+    printf '%s' "$(printf '%s' "${out# }" | tr ' ' '\n' | grep -v '^$' | sort -n | tr '\n' ',' | sed 's/,$//')"
 }
 
 # 按能力找芯片目录（型号只影响排序，不影响能不能找到）
