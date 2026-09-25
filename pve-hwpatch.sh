@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V2.9
+# 版本：V2.10
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -641,6 +641,31 @@ __PACKAGE__->register_method({
         return $res;
     },
 });
+__PACKAGE__->register_method({
+    name => 'hwhelp',
+    path => 'hwhelp',
+    method => 'GET',
+    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Audit']] },
+    description => "面板「使用说明」：返回说明书 HTML（由仓库 README 生成）。",
+    proxyto => 'node',
+    parameters => {
+        additionalProperties => 0,
+        properties => { node => get_standard_option('pve-node') },
+    },
+    returns => { type => 'object', properties => {} },
+    code => sub {
+        # 说明书是纯数据文件，按行读出来即可（不用 run_command，免得给 Perl 字符串
+        # 加一层转义）。内容由 tools/mkdoc.py 从 README.md 生成，安装时落到这里。
+        my $f = '/usr/local/lib/pve-hwtools/doc.html';
+        my $html = '';
+        if (open(my $fh, '<:encoding(UTF-8)', $f)) {
+            local $/;
+            $html = <$fh>;
+            close($fh);
+        }
+        return { found => ($html ne '' ? 1 : 0), html => ($html // '') };
+    },
+});
 # PVE_HWAPI:END
 '''
 s = s.replace(a2, api, 1)
@@ -1197,6 +1222,13 @@ Ext.define('PVE.node.HwTools', {
                             margin: '0 0 0 8',
                             handler: function () { me.reload(); },
                         },
+                        {
+                            xtype: 'button',
+                            text: gettext('使用说明'),
+                            iconCls: 'fa fa-book',
+                            margin: '0 0 0 8',
+                            handler: function () { me.showHelp(); },
+                        },
                     ],
                 },
             ],
@@ -1210,6 +1242,49 @@ Ext.define('PVE.node.HwTools', {
         });
     },
 
+
+        // 使用说明：说明书正文由宿主文件 /usr/local/lib/pve-hwtools/doc.html 提供
+        // （安装时由 tools/mkdoc.py 从仓库 README 生成），这里只负责取回并弹窗。
+        // 刻意不把正文内联进本注入块——那会往 ui 块塞进大量反斜杠与引号，
+        // 踩中「注入块禁止反斜杠转义」的铁律，一做就废。
+        showHelp: function () {
+            var me = this;
+            me.setLoading(gettext('正在载入说明书…'));
+            Proxmox.Utils.API2Request({
+                url: '/nodes/' + me.nodename + '/hwhelp',
+                method: 'GET',
+                failure: function (r) {
+                    me.setLoading(false);
+                    Ext.Msg.alert(gettext('使用说明'), gettext('读取失败：') + r.htmlStatus);
+                },
+                success: function (response) {
+                    me.setLoading(false);
+                    var d = (response.result && response.result.data) || {};
+                    if (!d.found || !d.html) {
+                        Ext.Msg.alert(gettext('使用说明'),
+                            gettext('宿主上没有说明书文件 /usr/local/lib/pve-hwtools/doc.html。') +
+                            gettext('重新执行一次 install.sh 即可装好；完整说明也可看仓库 README.md。'));
+                        return;
+                    }
+                    // 关掉旧的再开：反复点按钮不会层层叠窗
+                    if (me._helpWin) { me._helpWin.close(); me._helpWin = null; }
+                    var win = Ext.create('Ext.window.Window', {
+                        title: gettext('PVE 工具集 · 使用说明'),
+                        width: Math.min(980, Math.round(Ext.getBody().getWidth() * 0.92)),
+                        height: Math.round(Ext.getBody().getHeight() * 0.88),
+                        layout: 'fit',
+                        maximizable: true,
+                        modal: true,
+                        scrollable: true,
+                        bodyPadding: 14,
+                        html: d.html,
+                        listeners: { close: function () { me._helpWin = null; } },
+                    });
+                    me._helpWin = win;
+                    win.show();
+                },
+            });
+        },
 
         // 风扇通道控件**必须在这里动态创建**，不能写进 items 数组：
         // 面板类的 items 在脚本加载期就求值，那时既不知道本机有几个通道、也拿不到配置，

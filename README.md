@@ -1,6 +1,6 @@
 # Proxmox VE 面板补丁集
 
-> **当前版本：V2.9** · 发布于 2026-09-25
+> **当前版本：V2.10** · 发布于 2026-09-25
 > 适用：**Proxmox VE 9.x**（在 `pve-manager` 9.2.20 上实测通过）· 需 root
 
 给 PVE 原生 Web 界面补上它不显示的东西：**节点概要的硬件信息**、
@@ -20,6 +20,7 @@
 | **风扇控制** | System → PVE 工具集 | 自动曲线（主板硬件执行）/ 手动定值 / 关闭三态；通道命名、自动识别、测试识别、逐通道显示开关 |
 | **订阅提示** | System → PVE 工具集 | 屏蔽「无有效订阅」登录弹窗，可逆 |
 | **软件源镜像** | System → PVE 工具集 | 中科大 / 清华 / 阿里云 / 腾讯云 / 华为云 / 官方源一键切换 |
+| **使用说明** | System → PVE 工具集 | 页面内弹窗查看完整说明书（与仓库 README 同源） |
 
 **为什么需要它**：PVE 原生界面不显示温度、风扇、硬盘温度这些。以前常用 pvetools 的
 `chSensors`，但**每次 `pve-manager` 升级都会把补丁覆盖掉**，概要信息就「消失」。
@@ -76,7 +77,12 @@ install -m 755 pve-mirror-switch.sh /usr/local/bin/pve-mirror-switch.sh
 # 3) 打补丁（幂等，可反复跑）
 /usr/local/bin/pve-hwpatch.sh
 
-# 4) 挂 apt 钩子（强烈建议，见「四、升级与维护」）
+# 4) 使用说明（面板「使用说明」按钮弹出的那份；可选）
+mkdir -p /usr/local/lib/pve-hwtools
+pip install markdown && python3 tools/mkdoc.py    # 或直接用仓库里的产物
+install -m 644 pve-hwtools-doc.html /usr/local/lib/pve-hwtools/doc.html
+
+# 5) 挂 apt 钩子（强烈建议，见「四、升级与维护」）
 printf 'DPkg::Post-Invoke { "/usr/local/bin/pve-hwpatch.sh"; };\n'    > /etc/apt/apt.conf.d/98-pve-hwpatch
 printf 'DPkg::Post-Invoke { "/usr/local/bin/pve-nosub-patch.sh"; };\n' > /etc/apt/apt.conf.d/99-pve-nosub-patch
 apt-config dump | grep -i post-invoke   # 校验钩子已被 apt 读到
@@ -88,7 +94,7 @@ apt-config dump | grep -i post-invoke   # 校验钩子已被 apt 读到
 
 ### 装完怎么确认成功
 
-一键脚本结尾有自检，应看到 11 项全绿（顺序与脚本实际一致）：
+一键脚本结尾有自检，应看到 12 项全绿（顺序与脚本实际一致）：
 
 ```
 ✅ 补丁脚本就位
@@ -100,6 +106,7 @@ apt-config dump | grep -i post-invoke   # 校验钩子已被 apt 读到
 ✅ 配置 /etc/default/pve-hwtools 就位
 ✅ 后端已注入 Nodes.pm
 ✅ 前端已注入 pvemanagerlib.js
+✅ 使用说明 doc.html 就位
 ✅ pvedaemon 正常
 ✅ pveproxy 正常
 ```
@@ -138,6 +145,25 @@ pvesh get /nodes/<节点名>/hwtools --output-format json
 ### 2.2 「PVE 工具集」设置页
 
 节点 → **System → PVE 工具集**，五组设置。
+
+页面底部的三个按钮：
+
+| 按钮 | 作用 |
+|---|---|
+| **保存并应用** | 写入配置并施加（调频落内核、风扇下发给主板） |
+| **重新载入** | 丢弃未保存的改动，重新读一遍配置 |
+| **使用说明** | 弹出这份说明书（就是本文件） |
+
+> **「使用说明」按钮**：弹出的说明书与仓库的 `README.md` **同源** ——
+> 由 `tools/mkdoc.py` 把 README 转成 HTML，安装时落到
+> `/usr/local/lib/pve-hwtools/doc.html`，面板通过节点接口 `GET /nodes/{node}/hwhelp`
+> 取回后显示。想改说明内容，改 README 再重跑一次 `install.sh` 即可，两边不会各说各话。
+>
+> 面板版只收「安装 / 使用 / 配置 / 升级 / 卸载 / 常见问题」六章；`实现要点与踩坑`
+> 及其后的变更日志属开发笔记，不进面板（免得弹窗又长又难翻）。
+>
+> 在 git 工作副本里跑 `install.sh` 时，若本机装了 `python-markdown`，
+> 会**当场从 README 重新生成**，连重新提交都不必。
 
 #### 概要显示
 
@@ -455,6 +481,7 @@ FAN3_NAME=''
 | `/usr/local/lib/pve-hwtools/cpu-model.sh` | CPUID(family/model) → Intel/AMD 代号映射；`s.sh` 与 agent 共用 |
 | `/usr/local/lib/pve-hwtools/fan-baseline/` | 风扇各通道**原值**基线（`off` 的还原依据） |
 | `/usr/local/lib/pve-hwtools/fanscan.conf` | 风扇芯片探测缓存（换硬件时自动重写） |
+| `/usr/local/lib/pve-hwtools/doc.html` | 面板「使用说明」弹出的说明书 HTML（由 README 生成） |
 | `/etc/default/pve-hwtools` | **配置真相** |
 | `/etc/systemd/system/pve-hwtools-apply.service` | 开机自动施加配置 |
 | `/usr/share/perl5/PVE/API2/Nodes.pm` | 注入 `$res->{tdata}` + 注册节点级接口 |
@@ -687,6 +714,25 @@ apt 钩子没挂上。检查 `apt-config dump | grep -i post-invoke`，
 ---
 
 ## 更新日志
+
+### V2.10 · 2026-09-25
+
+**面板里就能看说明书：设置页新增「使用说明」按钮。**
+
+- **「使用说明」按钮**（设置页底部，与「保存并应用 / 重新载入」并列）：弹出可滚动、
+  可最大化的窗口，内含完整安装与使用说明。
+- **说明书与仓库 README 同源**：`tools/mkdoc.py` 把 README 转成 HTML（只取
+  「安装 / 使用 / 配置 / 升级 / 卸载 / 常见问题」六章，开发笔记与变更日志不入面板），
+  安装时落到 `/usr/local/lib/pve-hwtools/doc.html`；新节点接口
+  `GET /nodes/{node}/hwhelp` 读出来交给前端弹窗。改说明只需改 README + 重跑安装。
+- **正文刻意不内联进前端注入块**：那份 HTML 有三万多字符、满是反斜杠与引号，
+  内联会踩中「注入块禁止反斜杠转义」这条铁律（Python 三引号会先把它译掉，
+  整个 `pvemanagerlib.js` 加载失败）。改成独立数据文件 + 接口读取，注入块里
+  只有几行取回与弹窗逻辑。
+- **CSS 全部以 `.pve-hwtools-doc` 打头**：ExtJS 是把这段 HTML 直接塞进面板的，
+  不加作用域会让 `h1` / `table` 样式泄漏到整个 PVE 界面。
+- `install.sh` 自检加一项（`使用说明 doc.html 就位`，共 12 项）；说明书下载失败
+  **不会**让安装中止——只影响这个按钮，其余功能照常。卸载连 `doc.html` 一并清除。
 
 ### V2.9 · 2026-09-25
 

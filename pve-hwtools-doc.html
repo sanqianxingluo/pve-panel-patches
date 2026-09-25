@@ -1,0 +1,792 @@
+<!-- 由 tools/mkdoc.py 从 README.md 生成，请勿手工编辑 -->
+<style>
+.pve-hwtools-doc { line-height: 1.7; color: inherit; }
+.pve-hwtools-doc h1 { font-size: 20px; margin: 0 0 6px; padding-bottom: 6px;
+    border-bottom: 2px solid rgba(128,128,128,.35); }
+.pve-hwtools-doc h2 { font-size: 17px; margin: 22px 0 8px; padding-bottom: 4px;
+    border-bottom: 1px solid rgba(128,128,128,.25); }
+.pve-hwtools-doc h3 { font-size: 15px; margin: 18px 0 6px; }
+.pve-hwtools-doc h4 { font-size: 14px; margin: 14px 0 4px; }
+.pve-hwtools-doc p, .pve-hwtools-doc li { margin: 5px 0; }
+.pve-hwtools-doc ul, .pve-hwtools-doc ol { margin: 5px 0 5px 22px; padding: 0; }
+.pve-hwtools-doc hr { border: 0; border-top: 1px solid rgba(128,128,128,.25); margin: 18px 0; }
+.pve-hwtools-doc a { color: #1a67b3; text-decoration: none; }
+.pve-hwtools-doc a:hover { text-decoration: underline; }
+.pve-hwtools-doc code { font-family: Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    font-size: 12.5px; background: rgba(128,128,128,.16); padding: 1px 4px;
+    border-radius: 3px; }
+.pve-hwtools-doc pre { background: rgba(128,128,128,.13); border: 1px solid rgba(128,128,128,.25);
+    border-radius: 4px; padding: 9px 11px; overflow-x: auto; margin: 8px 0; }
+.pve-hwtools-doc pre code { background: none; padding: 0; font-size: 12.5px; }
+.pve-hwtools-doc blockquote { margin: 8px 0; padding: 6px 12px;
+    border-left: 3px solid rgba(128,128,128,.5); background: rgba(128,128,128,.08); }
+.pve-hwtools-doc blockquote p { margin: 4px 0; }
+.pve-hwtools-doc table { border-collapse: collapse; margin: 9px 0; width: auto;
+    max-width: 100%; font-size: 13px; }
+.pve-hwtools-doc th, .pve-hwtools-doc td { border: 1px solid rgba(128,128,128,.35);
+    padding: 4px 9px; text-align: left; vertical-align: top; }
+.pve-hwtools-doc th { background: rgba(128,128,128,.14); font-weight: 600; white-space: nowrap; }
+.pve-hwtools-doc details { margin: 9px 0; }
+.pve-hwtools-doc summary { cursor: pointer; font-weight: 600; margin-bottom: 5px; }
+.pve-hwtools-doc strong { font-weight: 600; }
+</style>
+<div class="pve-hwtools-doc">
+<h1>Proxmox VE 面板补丁集</h1>
+<blockquote>
+<p><strong>当前版本：V2.10</strong> · 发布于 2026-09-25
+适用：<strong>Proxmox VE 9.x</strong>（在 <code>pve-manager</code> 9.2.20 上实测通过）· 需 root</p>
+</blockquote>
+<p>给 PVE 原生 Web 界面补上它不显示的东西：<strong>节点概要的硬件信息</strong>、
+<strong>图形化的 CPU 调频与风扇控制</strong>、<strong>软件源镜像切换</strong>、<strong>订阅弹窗屏蔽</strong>。</p>
+<p>纯 shell 实现，除系统自带的 <code>python3</code> / <code>lm-sensors</code> / <code>smartmontools</code> 外无第三方依赖。
+所有改动<strong>可逆</strong>：卸载即还原原厂文件；风扇控制默认不动任何风扇。</p>
+<hr>
+<h2>功能总览</h2>
+<table>
+<thead>
+<tr>
+<th>功能</th>
+<th>位置</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>硬件概要</strong></td>
+<td>节点 → Summary</td>
+<td>CPU 温度（含各核）/ 主板温度 / 风扇转速（带名字）/ 硬盘型号容量温度 / CPU 频率与代号。四项可分别开关</td>
+</tr>
+<tr>
+<td><strong>CPU 调频</strong></td>
+<td>System → PVE 工具集</td>
+<td>调速器模式、频率上下限（MHz，受硬件钳制）、Turbo 开关、EPP 能效偏好</td>
+</tr>
+<tr>
+<td><strong>风扇控制</strong></td>
+<td>System → PVE 工具集</td>
+<td>自动曲线（主板硬件执行）/ 手动定值 / 关闭三态；通道命名、自动识别、测试识别、逐通道显示开关</td>
+</tr>
+<tr>
+<td><strong>订阅提示</strong></td>
+<td>System → PVE 工具集</td>
+<td>屏蔽「无有效订阅」登录弹窗，可逆</td>
+</tr>
+<tr>
+<td><strong>软件源镜像</strong></td>
+<td>System → PVE 工具集</td>
+<td>中科大 / 清华 / 阿里云 / 腾讯云 / 华为云 / 官方源一键切换</td>
+</tr>
+<tr>
+<td><strong>使用说明</strong></td>
+<td>System → PVE 工具集</td>
+<td>页面内弹窗查看完整说明书（与仓库 README 同源）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>为什么需要它</strong>：PVE 原生界面不显示温度、风扇、硬盘温度这些。以前常用 pvetools 的
+<code>chSensors</code>，但<strong>每次 <code>pve-manager</code> 升级都会把补丁覆盖掉</strong>，概要信息就「消失」。
+本补丁集做成<strong>幂等 + 可自愈</strong>：挂上 apt 钩子后，升级结束会自动重打。</p>
+<hr>
+<h2>一、安装</h2>
+<h3>方式 A：一键（推荐）</h3>
+<p>在 <strong>PVE 宿主</strong>上以 root 执行：</p>
+<pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/sanqianxingluo/pve-panel-patches/main/install.sh | bash
+</code></pre>
+<p>脚本会自动：装依赖 → 放脚本 → 挂 apt 钩子 → 打补丁 → 探测传感器 → 自检。
+<strong>幂等</strong>，可反复跑。</p>
+<h3>方式 B：先克隆再本地跑</h3>
+<pre><code class="language-bash">git clone https://github.com/sanqianxingluo/pve-panel-patches.git
+cd pve-panel-patches
+bash install.sh                    # 安装
+bash install.sh --uninstall        # 卸载
+bash install.sh --help             # 全部参数
+</code></pre>
+<p><code>install.sh</code> 的参数：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>（无）</td>
+<td>安装。幂等，可反复执行</td>
+</tr>
+<tr>
+<td><code>--uninstall</code> / <code>-u</code></td>
+<td>卸载：摘钩子、还原原厂文件、清补丁</td>
+</tr>
+<tr>
+<td><code>--ref &lt;分支/标签&gt;</code></td>
+<td>指定版本，如 <code>--ref v2.9</code>。默认 <code>main</code></td>
+</tr>
+<tr>
+<td><code>--no-deps</code></td>
+<td>跳过依赖安装（自己已装好时）</td>
+</tr>
+<tr>
+<td><code>--help</code> / <code>-h</code></td>
+<td>用法</td>
+</tr>
+</tbody>
+</table>
+<h3>方式 C：手工部署（想自己掌控每一步）</h3>
+<pre><code class="language-bash"># 1) 依赖（install.sh 会装的一整套）
+apt-get install -y lm-sensors smartmontools cpufrequtils linux-cpupower python3
+sensors-detect --auto                 # 首次需探测传感器
+
+# 2) 放脚本
+install -m 755 pve-hwpatch.sh       /usr/local/bin/pve-hwpatch.sh
+install -m 755 pve-hwtools-agent    /usr/local/bin/pve-hwtools-agent
+install -m 755 pve-nosub-patch.sh   /usr/local/bin/pve-nosub-patch.sh
+install -m 755 pve-mirror-switch.sh /usr/local/bin/pve-mirror-switch.sh
+
+# 3) 打补丁（幂等，可反复跑）
+/usr/local/bin/pve-hwpatch.sh
+
+# 4) 使用说明（面板「使用说明」按钮弹出的那份；可选）
+mkdir -p /usr/local/lib/pve-hwtools
+pip install markdown &amp;&amp; python3 tools/mkdoc.py    # 或直接用仓库里的产物
+install -m 644 pve-hwtools-doc.html /usr/local/lib/pve-hwtools/doc.html
+
+# 5) 挂 apt 钩子（强烈建议，见「四、升级与维护」）
+printf 'DPkg::Post-Invoke { &quot;/usr/local/bin/pve-hwpatch.sh&quot;; };\n'    &gt; /etc/apt/apt.conf.d/98-pve-hwpatch
+printf 'DPkg::Post-Invoke { &quot;/usr/local/bin/pve-nosub-patch.sh&quot;; };\n' &gt; /etc/apt/apt.conf.d/99-pve-nosub-patch
+apt-config dump | grep -i post-invoke   # 校验钩子已被 apt 读到
+</code></pre>
+<blockquote>
+<p><strong>只需这四个文件</strong>。<code>/usr/bin/s.sh</code>、<code>/usr/local/lib/pve-hwtools/cpu-model.sh</code>、
+<code>/etc/default/pve-hwtools</code>、systemd 单元 <code>pve-hwtools-apply.service</code>
+都由 <code>pve-hwpatch.sh</code> 自行落盘，无需手工放。</p>
+</blockquote>
+<h3>装完怎么确认成功</h3>
+<p>一键脚本结尾有自检，应看到 12 项全绿（顺序与脚本实际一致）：</p>
+<pre><code>✅ 补丁脚本就位
+✅ 状态代理就位
+✅ 订阅屏蔽脚本就位
+✅ 镜像切换脚本就位
+✅ 取样脚本 /usr/bin/s.sh 就位
+✅ CPU 世代映射就位
+✅ 配置 /etc/default/pve-hwtools 就位
+✅ 后端已注入 Nodes.pm
+✅ 前端已注入 pvemanagerlib.js
+✅ 使用说明 doc.html 就位
+✅ pvedaemon 正常
+✅ pveproxy 正常
+</code></pre>
+<p>然后在<strong>浏览器</strong>里：登录 → <strong>Ctrl+Shift+R 强刷一次</strong>（旧 JS 有缓存）→
+点左侧资源树的节点 → 左菜单 <strong>Summary</strong> 应出现「硬件概要」；
+点 <strong>System → PVE 工具集</strong> 应出现全部设置分组。</p>
+<p>命令行也能直接验：</p>
+<pre><code class="language-bash">/usr/bin/s.sh                                    # 取样脚本的单行 JSON
+pve-hwtools-agent status                         # 状态代理的完整状态
+pvesh get /nodes/&lt;节点名&gt;/hwtools --output-format json
+</code></pre>
+<hr>
+<h2>二、使用</h2>
+<h3>2.1 节点概要的「硬件概要」</h3>
+<p>节点 → <strong>Summary</strong>，右侧出现一整块：</p>
+<ul>
+<li><strong>CPU 温度</strong>（封装）、<strong>主板温度</strong></li>
+<li><strong>CPU 各核</strong> —— 带核名：<code>Core 0 43.0 °C | Core 1 42.0 °C | …</code></li>
+<li><strong>风扇转速</strong> —— 带名字：<code>CPU 风扇 1053 RPM | 机箱风扇 1331 RPM</code></li>
+<li><strong>硬盘温度</strong> —— 型号 + 容量 + 温度：<code>Lexar SSD NM620 512GB 39 °C</code>
+  （NVMe 走 hwmon，SATA 走 <code>smartctl</code>）</li>
+<li><strong>CPU 频率</strong> —— 实时 / 最小 / 最大（MHz）；下方第二行显示 <strong>CPU 代号与基准频率</strong>，
+  如 <code>Alder Lake (12th Gen Core) · 基准 3300 MHz</code></li>
+</ul>
+<p>四项<strong>可分别开关</strong>（见 2.2 的「概要显示」），关掉的条目连同占位一起隐藏，
+面板高度随之收缩。</p>
+<h3>2.2 「PVE 工具集」设置页</h3>
+<p>节点 → <strong>System → PVE 工具集</strong>，五组设置。</p>
+<p>页面底部的三个按钮：</p>
+<table>
+<thead>
+<tr>
+<th>按钮</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>保存并应用</strong></td>
+<td>写入配置并施加（调频落内核、风扇下发给主板）</td>
+</tr>
+<tr>
+<td><strong>重新载入</strong></td>
+<td>丢弃未保存的改动，重新读一遍配置</td>
+</tr>
+<tr>
+<td><strong>使用说明</strong></td>
+<td>弹出这份说明书（就是本文件）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>「使用说明」按钮</strong>：弹出的说明书与仓库的 <code>README.md</code> <strong>同源</strong> ——
+由 <code>tools/mkdoc.py</code> 把 README 转成 HTML，安装时落到
+<code>/usr/local/lib/pve-hwtools/doc.html</code>，面板通过节点接口 <code>GET /nodes/{node}/hwhelp</code>
+取回后显示。想改说明内容，改 README 再重跑一次 <code>install.sh</code> 即可，两边不会各说各话。</p>
+<p>面板版只收「安装 / 使用 / 配置 / 升级 / 卸载 / 常见问题」六章；<code>实现要点与踩坑</code>
+及其后的变更日志属开发笔记，不进面板（免得弹窗又长又难翻）。</p>
+<p>在 git 工作副本里跑 <code>install.sh</code> 时，若本机装了 <code>python-markdown</code>，
+会<strong>当场从 README 重新生成</strong>，连重新提交都不必。</p>
+</blockquote>
+<h4>概要显示</h4>
+<p>四个勾选框：CPU 温度（含各核）/ 风扇转速 / 硬盘概要 / CPU 频率。</p>
+<h4>CPU 调频</h4>
+<ul>
+<li><strong>调频模式</strong> —— <code>performance</code> / <code>powersave</code> / <code>ondemand</code> / <code>conservative</code> / <code>schedutil</code></li>
+<li><strong>频率下限 / 上限</strong> —— 单位 <strong>MHz</strong>，输入范围<strong>受 <code>/sys</code> 报告的硬件能力钳制</strong>，
+  越界会被后端拒绝</li>
+<li><strong>Turbo 加速</strong> —— 启用 / 关闭（不支持的平台该控件自动禁用）</li>
+<li><strong>能效偏好 EPP</strong> —— <code>performance</code> / <code>balance_performance</code> / <code>balance_power</code> / <code>power</code>
+  （仅平台支持时可用）</li>
+</ul>
+<p>下方灰字实时显示本机 CPU 型号与代号、驱动、硬件能力范围、内核实际生效值与当前频率。</p>
+<p>「保存并应用」<strong>真写系统</strong>：经 <code>cpupower frequency-set</code> 落内核，可随时改回。</p>
+<h4>订阅提示</h4>
+<p>勾选即屏蔽「无有效订阅」登录弹窗，取消勾选即恢复。由独立脚本 <code>pve-nosub-patch.sh</code>
+实现，双向可逆。</p>
+<h4>软件源</h4>
+<p>选择 Debian / Proxmox 的软件源镜像：</p>
+<table>
+<thead>
+<tr>
+<th>镜像</th>
+<th>代号</th>
+<th>Debian</th>
+<th>Proxmox</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>中科大</td>
+<td><code>ustc</code></td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>清华大学</td>
+<td><code>tuna</code></td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>阿里云</td>
+<td><code>aliyun</code></td>
+<td>✅</td>
+<td>✗ 无 <code>/proxmox/</code> 路径</td>
+</tr>
+<tr>
+<td>腾讯云</td>
+<td><code>tencent</code></td>
+<td>✅</td>
+<td>✗ 无 <code>/proxmox/</code> 路径</td>
+</tr>
+<tr>
+<td>华为云</td>
+<td><code>huawei</code></td>
+<td>✅</td>
+<td>✗ 索引签名无效，apt 拒用</td>
+</tr>
+<tr>
+<td>官方源</td>
+<td><code>official</code></td>
+<td>✅</td>
+<td>✅（国内访问较慢）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>阿里云、腾讯云、华为云的 <strong>PVE 包会自动走官方源</strong>（Debian 部分仍走本地镜像，照样快）——
+这三家的 Proxmox 镜像要么不存在、要么坏了，这是实测踩过才知道的。</p>
+</blockquote>
+<p><strong>设计取舍</strong>：<strong>切换本身不做连通性检查</strong>，只改写源文件；镜像通不通由你 <code>apt-get update</code>
+自测。镜像可达性随时间波动，把它当切换成功与否的判据会让切换动不动就失败回滚。
+另外只改<strong>认得出的公共镜像</strong>，自家内网仓库等自定义源<strong>原样保留</strong>。</p>
+<h4>风扇控制</h4>
+<p>这一组最需要解释，单独一节。见 <strong>2.3</strong>。</p>
+<h3>2.3 风扇控制</h3>
+<p>面板：<strong>System → PVE 工具集 → 风扇控制</strong>。</p>
+<h4>先理解「控制器」和「风扇名」是两件事</h4>
+<p>主板的 Super I/O 芯片只提供 <strong>pwm 控制器通道</strong>（<code>pwm1</code> / <code>pwm2</code> / <code>pwm3</code> …），
+<strong>它不知道哪个通道上插的是哪个风扇</strong>。所以：</p>
+<ul>
+<li><strong>通道号</strong>（<code>pwm1</code>、<code>pwm2</code>…）是硬件给的，固定</li>
+<li><strong>名字</strong>是你绑定的，存进配置，显示在概要页</li>
+</ul>
+<h4>每行有哪些控件</h4>
+<table>
+<thead>
+<tr>
+<th>控件</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>模式</strong>（三选一）</td>
+<td><code>关闭（用主板设置）</code> / <code>自动曲线</code> / <code>手动定值</code></td>
+</tr>
+<tr>
+<td><strong>占空比</strong></td>
+<td>仅「手动定值」可用，1~255（<strong>下限锁 1，绝不写 0</strong> —— 0 就是停转）</td>
+</tr>
+<tr>
+<td><strong>跟哪路温度</strong></td>
+<td>仅「自动曲线」可用。决定该通道随哪一路温度升降</td>
+</tr>
+<tr>
+<td><strong>名字</strong></td>
+<td>自由文本，支持中文。留空则界面显示「通道 N」</td>
+</tr>
+<tr>
+<td><strong>显示</strong></td>
+<td><code>自动显示</code> / <code>始终显示</code> / <code>不显示</code> —— 只影响概要页是否列出该通道</td>
+</tr>
+<tr>
+<td><strong>测试识别</strong></td>
+<td>见下</td>
+</tr>
+</tbody>
+</table>
+<h4>三种模式</h4>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>关闭（用主板设置）</strong></td>
+<td><strong>默认</strong>。完全不动主板原有策略，补丁不改变任何风扇行为</td>
+</tr>
+<tr>
+<td><strong>自动曲线</strong></td>
+<td>把五点曲线下发给主板芯片，<strong>由硬件自己调速</strong>——主机侧无需任何常驻程序，不占 CPU、不受系统负载影响，重启后由 <code>pve-hwtools-apply.service</code> 自动铺回</td>
+</tr>
+<tr>
+<td><strong>手动定值</strong></td>
+<td>固定占空比（1~255），用于排查问题或固定风量</td>
+</tr>
+</tbody>
+</table>
+<h4>「跟哪路温度」</h4>
+<p>下拉里的选项是<strong>人话</strong>，不是芯片的原始标签：</p>
+<pre><code>CPU 核心温度 （推荐） · 46.0 °C      ← PECI，CPU 硅片自身，最准
+CPU 插座温度 （推荐） · 40.0 °C      ← CPUTIN，CPU 插座处
+主板温度 · 41.0 °C                   ← SYSTIN
+未接传感器 （未接） · 35.0 °C        ← AUXTIN*，绝大多数主板这里没接东西
+</code></pre>
+<ul>
+<li><strong>推荐的排最前</strong>（<code>CPU 核心温度</code> / <code>CPU 插座温度</code>）</li>
+<li><strong><code>未接传感器</code> 排最后并标注</strong> —— 选中空脚意味着风扇<strong>不跟任何温度走</strong></li>
+<li>括号里是<strong>当前读数</strong>，选之前就知道这路现在多少度</li>
+</ul>
+<blockquote>
+<p><strong>一个通道只能跟一路温度。</strong> 芯片的 <code>pwmN_temp_sel</code> 是单值（实测范围 <code>1~12</code> =
+<code>temp1~temp12</code>）。想让 CPU 风扇跟 CPU 温度、机箱风扇跟主板温度，就把它们<strong>分到不同通道</strong>去。</p>
+<p>模式为「关闭」时，该列显示的是<strong>主板当前实际在跟的温度源</strong>（不是配置里存的值）——
+因为配置值要切到「自动曲线」才生效，显示它只会误导。</p>
+</blockquote>
+<h4>曲线怎么写</h4>
+<p>五个点，形如「温度 → 占空比」，<strong>温度必须严格递增</strong>：</p>
+<pre><code>FAN1_CURVE=25:30,30:60,45:120,60:200,80:255
+              ↑ 25°C 时 30%   ↑ 30°C 时 60%  …  ↑ 80°C 时 255（满速）
+</code></pre>
+<p>温度单位写摄氏度，脚本会折成芯片要的毫摄氏度。</p>
+<h4>自动识别风扇</h4>
+<p>分组顶部的「<strong>自动识别风扇</strong>」按钮，做两件<strong>能被证实</strong>的事：</p>
+<ol>
+<li>逐个试探各插针，认出哪些插针<strong>真接了风扇</strong>
+   （<strong>只试静止的</strong>；正在转的已确认有风扇，且动它风险最大——绝不打扰）</li>
+<li>按各通道自己声明的温度源归类命名，<strong>未接风扇的通道自动隐藏</strong></li>
+</ol>
+<p><strong>已有名字不会被覆盖</strong>——那是你自己标的，比推断可信。</p>
+<h4>测试识别</h4>
+<p>每行一个按钮，让该通道<strong>明显变一次转速</strong>（实测 1060 → 1620 RPM），
+便于你<strong>听声辨位</strong>；测完<strong>无条件还原</strong>主板设置。</p>
+<p>这是唯一可靠的「认风扇」办法 —— 原因见下。</p>
+<blockquote>
+<h3>必须如实知道的一点</h3>
+<p>主板芯片<strong>不提供风扇名</strong>（<code>fan*_label</code> 全空），也<strong>无法从硬件区分哪个插头是 CPU 风扇</strong>。</p>
+<p>实测过：把靠 CPU 的通道从 1108 转压到 349 转，CPU 温度只从 47 °C 动到 46 °C ——
+待机功耗太低，信号全在噪声里，<strong>靠升温差判不出来</strong>。</p>
+<p>所以自动识别<strong>只做能证实的判断</strong>，名字按温度源归类，<strong>不猜物理身份</strong>。
+若名字不对，用「测试识别」听声后手动改名 —— 这是唯一可靠的办法。</p>
+</blockquote>
+<h4>重新识别芯片与通道（换主板用）</h4>
+<p>分组顶部的「<strong>重新识别芯片与通道</strong>」按钮。</p>
+<p>芯片是<strong>按能力找</strong>的，不是按型号名找：哪个 <code>hwmon</code> 目录里有可写的 <code>pwmN</code>，
+就是可控风扇芯片 —— 所以换成 ITE / Fintek / Winbond 等其他 Super I/O 也能认出来。
+型号家族只用于<strong>排序</strong>（优先认 NCT67xx）。</p>
+<p>点它会重扫本机所有 <code>hwmon</code> 设备并列出结果：</p>
+<pre><code>扫描完成
+已识别风扇芯片：nct6798，可控通道 1 2 3 4 5 7。
+/sys/class/hwmon/hwmon0  acpitz     无 pwm 通道
+/sys/class/hwmon/hwmon1  nvme       无 pwm 通道
+/sys/class/hwmon/hwmon2  coretemp   无 pwm 通道
+/sys/class/hwmon/hwmon3  nct6798    通道 1,2,3,4,5,7
+</code></pre>
+<p><strong>换主板时它会问你要「保留名字」还是「清空名字」</strong> —— 这一步必须由你决定，
+因为新板子的通道号含义完全不同：旧板上的「机箱风扇」（pwm2）到新板上可能正好是
+CPU 插针，<strong>留着名字就是张冠李戴</strong>。</p>
+<p>概要页也会显示识别到的芯片，换板后一眼看出认对没有：</p>
+<pre><code>风扇：nct6798（/sys/class/hwmon/hwmon3）· 通道 1,2,3,4,5,7，本机可控
+</code></pre>
+<h4>命令行</h4>
+<pre><code class="language-bash">pve-hwtools-agent status                          # 各通道转速、模式、温度源、名字
+pve-hwtools-agent status | python3 -m json.tool   # 完整状态（含 fan_chip / fan_hwid）
+
+# 自动曲线
+pve-hwtools-agent set fan1_mode=auto fan1_sel=8 \
+    fan1_curve=25:30,30:60,45:120,60:200,80:255
+
+# 手动定值
+pve-hwtools-agent set fan1_mode=manual fan1_manual=128
+
+# 还原主板设置
+pve-hwtools-agent set fan1_mode=off
+
+# 命名（名字用百分号编码传递：Perl 反引号读 UTF-8 会二次编码变乱码）
+pve-hwtools-agent set fan1_name=CPU%20%E9%A3%8E%E6%89%87              # 「CPU 风扇」
+pve-hwtools-agent set fan2_name=%E6%9C%BA%E7%AE%B1%E9%A3%8E%E6%89%87   # 「机箱风扇」
+pve-hwtools-agent set fan3_name=                                      # 清空名字
+
+# 逐通道显示（概要页）
+pve-hwtools-agent set show_fanch_3=off            # auto / on / off
+
+# 识别与扫描
+pve-hwtools-agent fan-detect                      # 只探测，不改配置
+pve-hwtools-agent fan-bind                        # 自动识别并写入名字
+pve-hwtools-agent fan-test 1                      # 测试通道 1（约 12 秒，自动还原）
+pve-hwtools-agent fan-rescan 1                    # 重扫芯片与通道，保留名字
+pve-hwtools-agent fan-rescan 0                    # 重扫并清空通道配置
+pve-hwtools-agent fan-scan                        # 看探测缓存
+</code></pre>
+<p><strong>百分号编码怎么算</strong>（要写中文名字时）：</p>
+<pre><code class="language-bash">printf '%s' &quot;CPU 风扇&quot; | od -An -tx1 | tr -d ' \n' | sed 's/\(..\)/%\1/g'
+# → %43%50%55%20%e9%a3%8e%e6%89%87
+</code></pre>
+<p><strong>为什么不直接写中文</strong>：宿主侧 Perl 反引号读 UTF-8 会二次编码，
+<code>CPU 风扇</code> 过一趟只剩 <code>CPU</code>（尾部被吃）。编码成纯 ASCII 才安全。</p>
+<h4>安全设计</h4>
+<p>风扇写错可能烧硬件，所以守得比较严：</p>
+<ul>
+<li><strong>默认全 <code>off</code></strong> —— 装上补丁不改变任何风扇行为，要动必须明确指定</li>
+<li>首次碰某通道前，先把它的<strong>全部原始值</strong>存进
+  <code>/usr/local/lib/pve-hwtools/fan-baseline/pwmN.saved</code> —— 内容是 <code>enable</code> / <code>mode</code> /
+  <code>temp_sel</code> / <code>floor</code> / <code>start</code> / <code>stop_time</code> / <code>step_up_time</code> / <code>step_down_time</code> /
+  <code>temp_tolerance</code> / 当前 <code>pwm</code>，外加五组曲线点 <code>pointN_temp</code> / <code>pointN_pwm</code>；
+  <code>off</code> 即按此逐项还原（实测该文件 19 行，本机通道 1、2、3、4、5、7 各一份）</li>
+<li><strong>基线只在首次创建、绝不覆盖</strong></li>
+<li>施加后 3 秒复读转速：<strong>原本在转、现在变 0 → 立即还原并报错</strong></li>
+<li>手动占空比下限强制 <code>&gt;= 1</code>，<strong>绝不写 0</strong></li>
+<li><code>auto</code> 模式<strong>先铺好曲线、最后才写 <code>enable</code></strong>，避免中途以半截曲线运行</li>
+<li>手动定值<strong>必须先写 <code>enable</code>、再写 <code>pwm</code></strong> —— 顺序反了会看到「写 255 反而变慢」
+  （SmartFan→手动 的切换瞬间占空比被锁存到旧值）</li>
+<li>自动识别<strong>只试静止的插针</strong>，正在转的绝不打扰</li>
+<li><strong>换硬件后基线自动重存</strong>（见「四、升级与维护」）</li>
+</ul>
+<hr>
+<h2>三、配置参考</h2>
+<h3><code>pve-hwtools-agent</code> 全部子命令</h3>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>status</code></td>
+<td>输出完整状态 JSON（含硬件信息、风扇、配置）</td>
+</tr>
+<tr>
+<td><code>set k=v …</code></td>
+<td>批量改配置并施加（任一非法则<strong>一条都不生效</strong>）</td>
+</tr>
+<tr>
+<td><code>apply</code></td>
+<td>按当前配置重新施加（改过配置文件后跑这个）</td>
+</tr>
+<tr>
+<td><code>mirrors</code></td>
+<td>软件源镜像相关操作</td>
+</tr>
+<tr>
+<td><code>fan-test N</code></td>
+<td>测试通道 N（约 12 秒，自动还原）</td>
+</tr>
+<tr>
+<td><code>fan-detect</code></td>
+<td>只探测风扇存在性，不改配置</td>
+</tr>
+<tr>
+<td><code>fan-bind</code></td>
+<td>自动识别并写入通道名</td>
+</tr>
+<tr>
+<td><code>fan-bind-progress</code></td>
+<td>查自动识别的进度 JSON</td>
+</tr>
+<tr>
+<td><code>fan-rescan [keep]</code></td>
+<td>重扫芯片与通道；<code>keep=1</code> 保留名字</td>
+</tr>
+<tr>
+<td><code>fan-scan</code></td>
+<td>查看探测缓存</td>
+</tr>
+</tbody>
+</table>
+<h3><code>pve-mirror-switch.sh</code> 全部子命令</h3>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list</code></td>
+<td>列出全部镜像及各自地址</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>显示当前镜像（JSON）</td>
+</tr>
+<tr>
+<td><code>set &lt;代号&gt;</code></td>
+<td>切换镜像（只改写源文件，不做连通性检查）</td>
+</tr>
+<tr>
+<td><code>probe</code></td>
+<td>探测各镜像当前可达性（查询用）</td>
+</tr>
+</tbody>
+</table>
+<h3><code>/etc/default/pve-hwtools</code> 配置全表</h3>
+<p>这是唯一的配置真相 —— 面板读写的都是它，也可手工编辑后执行
+<code>pve-hwtools-agent apply</code>。</p>
+<pre><code class="language-bash"># ── 概要显示开关（1 开 / 0 关）──
+SHOW_CPU_TEMP=1
+SHOW_FAN=1
+SHOW_DISK=1
+SHOW_CPU_FREQ=1
+
+# ── 订阅提示屏蔽 ──
+BLOCK_SUBSCRIPTION_PROMPT=1
+
+# ── CPU 调频（频率单位 MHz；范围须落在硬件能力内）──
+CPU_GOVERNOR=conservative     # performance/powersave/ondemand/conservative/schedutil
+CPU_FREQ_MIN=800
+CPU_FREQ_MAX=3800
+CPU_TURBO=1                   # 1 启用 / 0 关闭
+CPU_EPP=balance_performance   # performance/balance_performance/balance_power/power
+
+# ── 软件源镜像 ──
+APT_MIRROR=ustc               # ustc/tuna/aliyun/tencent/huawei/official
+
+# ── 风扇控制（默认 off = 不改动主板原有策略）──
+#   FANn_MODE   off / auto / manual
+#   FANn_SEL    温度源编号（1=SYSTIN 2=CPUTIN 8=PECI…）
+#   FANn_MANUAL 手动占空比 1~255
+#   FANn_CURVE  五个点「温度:占空比」，温度须严格递增
+FAN1_MODE=off
+FAN1_SEL=2
+FAN1_MANUAL=128
+FAN1_CURVE=25:30,30:60,45:120,60:200,80:255
+# … FAN2 ~ FAN7 同构
+
+# ── 概要页每通道显示（auto=有转速才显示 / on=始终显示 / off=不显示）──
+FANCH_SHOW_DEFAULT=auto
+SHOW_FANCH_1=auto
+SHOW_FANCH_2=auto
+# …（按本机通道数）
+
+# ── 各通道名字（通道号 != 名字；留空则界面显示「通道 N」）──
+#   值带空格必须加引号——本文件会被 bash source，不加引号会把名字当命令执行
+FAN1_NAME='CPU 风扇'
+FAN2_NAME='机箱风扇'
+FAN3_NAME=''
+</code></pre>
+<h3>它改了/新建了哪些文件</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/usr/local/bin/pve-hwpatch.sh</code></td>
+<td>概要硬件信息 + 工具集设置页（打补丁脚本）</td>
+</tr>
+<tr>
+<td><code>/usr/local/bin/pve-hwtools-agent</code></td>
+<td>状态代理：读写配置、施加调频与风扇、触发重渲染</td>
+</tr>
+<tr>
+<td><code>/usr/local/bin/pve-nosub-patch.sh</code></td>
+<td>订阅提示屏蔽（双向可逆）</td>
+</tr>
+<tr>
+<td><code>/usr/local/bin/pve-mirror-switch.sh</code></td>
+<td>软件源镜像切换</td>
+</tr>
+<tr>
+<td><code>/usr/bin/s.sh</code></td>
+<td>取样脚本，输出单行 JSON（纯 ASCII 数值，频率单位 MHz）</td>
+</tr>
+<tr>
+<td><code>/usr/local/lib/pve-hwtools/cpu-model.sh</code></td>
+<td>CPUID(family/model) → Intel/AMD 代号映射；<code>s.sh</code> 与 agent 共用</td>
+</tr>
+<tr>
+<td><code>/usr/local/lib/pve-hwtools/fan-baseline/</code></td>
+<td>风扇各通道<strong>原值</strong>基线（<code>off</code> 的还原依据）</td>
+</tr>
+<tr>
+<td><code>/usr/local/lib/pve-hwtools/fanscan.conf</code></td>
+<td>风扇芯片探测缓存（换硬件时自动重写）</td>
+</tr>
+<tr>
+<td><code>/usr/local/lib/pve-hwtools/doc.html</code></td>
+<td>面板「使用说明」弹出的说明书 HTML（由 README 生成）</td>
+</tr>
+<tr>
+<td><code>/etc/default/pve-hwtools</code></td>
+<td><strong>配置真相</strong></td>
+</tr>
+<tr>
+<td><code>/etc/systemd/system/pve-hwtools-apply.service</code></td>
+<td>开机自动施加配置</td>
+</tr>
+<tr>
+<td><code>/usr/share/perl5/PVE/API2/Nodes.pm</code></td>
+<td>注入 <code>$res-&gt;{tdata}</code> + 注册节点级接口</td>
+</tr>
+<tr>
+<td><code>/usr/share/pve-manager/js/pvemanagerlib.js</code></td>
+<td>插入概要条目、隐藏逻辑、设置页、菜单项</td>
+</tr>
+<tr>
+<td><code>/etc/apt/apt.conf.d/98-pve-hwpatch</code><br><code>/etc/apt/apt.conf.d/99-pve-nosub-patch</code></td>
+<td>apt 钩子：升级后自动重打</td>
+</tr>
+<tr>
+<td><code>/root/pve-upgrade-backup/</code></td>
+<td>原厂文件备份、源文件快照</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2>四、升级与维护</h2>
+<h3>让它经得住 <code>apt upgrade</code>（重要）</h3>
+<p><code>pve-manager</code> 每次升级都会覆盖 <code>Nodes.pm</code> 与 <code>pvemanagerlib.js</code>，
+所以<strong>务必挂上 apt 钩子</strong>（一键脚本会自动挂）：</p>
+<pre><code class="language-bash">cat &gt; /etc/apt/apt.conf.d/98-pve-hwpatch &lt;&lt;'EOF'
+DPkg::Post-Invoke { &quot;/usr/local/bin/pve-hwpatch.sh&quot;; };
+EOF
+
+cat &gt; /etc/apt/apt.conf.d/99-pve-nosub-patch &lt;&lt;'EOF'
+DPkg::Post-Invoke { &quot;/usr/local/bin/pve-nosub-patch.sh&quot;; };
+EOF
+
+apt-config dump | grep -i post-invoke     # 校验钩子已被 apt 读到
+</code></pre>
+<p>此后每次 <code>apt upgrade</code> 事务结束都会自动重打，无需人工干预。</p>
+<p>补丁脚本<strong>幂等</strong>：每次先剥掉自己的旧注入块再重打，所以可反复执行，
+升版后也能自我更新。（只用单一标记的写法打完一次就再也改不动——本补丁不是。）</p>
+<h3>换主板</h3>
+<p>风扇芯片换了，需要重探。点面板上的「<strong>重新识别芯片与通道</strong>」，或：</p>
+<pre><code class="language-bash">pve-hwtools-agent fan-rescan 0   # 重扫 + 清空通道配置（换板建议）
+pve-hwtools-agent fan-rescan 1   # 重扫 + 保留名字与显示设置
+</code></pre>
+<p>另外<strong>硬件变化会被自动发现</strong>：探测结果按 <code>HWID</code>（芯片名 + 通道集合）缓存，
+指纹一变（换主板、换内核）就自动重探，并把<strong>原值基线</strong>挪走重存 ——</p>
+<blockquote>
+<p>旧的 <code>pwmN.saved</code> 里记的是<strong>前一块板子</strong>的原值。换板后拿它去还原，
+等于把旧板的设置往新板上写。所以必须重存。</p>
+</blockquote>
+<p>旧基线按时间戳存为 <code>fan-baseline.old-&lt;时间戳&gt;</code>，<strong>不删</strong>，万一要回查还在。</p>
+<h3>换内核</h3>
+<p><code>pve-hwpatch.sh</code> 本身与内核无关，<code>hwmon</code> 与驱动随内核走，风扇部分无需额外操作。</p>
+<blockquote>
+<p>但<strong>若你用了核显 SR-IOV 之类的 DKMS 模块</strong>，注意 DKMS 只编给被钉选的内核，
+换内核必须同改钉选并重编 DKMS，否则重启仍进旧内核、相关设备全失。</p>
+</blockquote>
+<h3>修改配置后</h3>
+<p>面板上点「保存并应用」即生效。手工改过 <code>/etc/default/pve-hwtools</code> 后执行：</p>
+<pre><code class="language-bash">pve-hwtools-agent apply
+</code></pre>
+<hr>
+<h2>五、卸载 / 还原</h2>
+<pre><code class="language-bash">bash install.sh --uninstall
+</code></pre>
+<p>脚本按顺序做：</p>
+<ol>
+<li><strong>摘除 apt 钩子</strong>（<code>98-pve-hwpatch</code> / <code>99-pve-nosub-patch</code>）</li>
+<li><strong>停用并移除</strong> <code>pve-hwtools-apply.service</code></li>
+<li><strong>还原被改的 PVE 原厂文件</strong> —— 两级策略，优先更强的那层：
+   - ① <strong>重装包</strong>：<code>apt install --reinstall pve-manager proxmox-widget-toolkit</code>
+     —— 唯一能 100% 回到<strong>当前版本</strong>原厂内容的办法
+   - ② <strong>剥离注入</strong>（离线时）：删掉所有注入标记块、把面板高度复位成原厂值。
+     实测剥离后与当前版本原厂文件<strong>逐字节一致</strong></li>
+<li><strong>关闭订阅提示屏蔽</strong>（改配置为 0 并重跑一次以恢复原厂行为）</li>
+<li><strong>删除补丁文件</strong>（四个脚本 + <code>/usr/bin/s.sh</code> + <code>/usr/local/lib/pve-hwtools/</code>）</li>
+<li><strong>重启</strong> <code>pvedaemon</code> + <code>pveproxy</code></li>
+</ol>
+<blockquote>
+<p><strong>不要手工 <code>cp</code> 备份文件去还原。</strong> 那正是 V2.2 修掉的坑：
+<code>*.bak.hwpatch</code> 可能是<strong>上一代大版本</strong>的原厂件（例如 8.4.19 的备份 vs 现役 9.2.20 的
+文件），用它覆盖会让 PVE 核心文件版本错乱、<code>pvedaemon</code> 起不来。
+走 <code>--uninstall</code> 的两级还原才对。</p>
+</blockquote>
+<p>卸载<strong>会保留</strong>：</p>
+<ul>
+<li><code>/etc/default/pve-hwtools</code>（配置，含你的风扇名字等）</li>
+<li><code>/root/pve-upgrade-backup/</code>（原厂备份）</li>
+</ul>
+<p>要彻底清除自行删除即可。</p>
+<hr>
+<h2>六、常见问题</h2>
+<p><strong>Q：刷新页面后没看到「硬件概要」？</strong>
+先 <strong>Ctrl+Shift+R</strong> 强刷（旧 JS 有缓存）。仍不行则查
+<code>grep -c PVE_HWAPI /usr/share/perl5/PVE/API2/Nodes.pm</code> 是否非 0，
+以及 <code>systemctl status pvedaemon pveproxy</code>。</p>
+<p><strong>Q：温度/风扇不显示或不全？</strong>
+<code>lm-sensors</code> 可能没探测过：<code>sensors-detect --auto</code>，然后 <code>sensors</code> 看有没有读数。</p>
+<p><strong>Q：风扇分组是空的 / 显示「本机未识别到可控风扇通道」？</strong>
+说明没找到可控 pwm 通道。点「重新识别芯片与通道」看扫描结果：
+若所有设备的通道都是空的，可能是 Super I/O 驱动没加载
+（<code>modprobe nct6775</code>，或对应的 <code>it87</code> / <code>w83627ehf</code> 等），或本机确实没有可控风扇。</p>
+<p><strong>Q：为什么名字要自己填，不能自动读出来？</strong>
+因为<strong>芯片不提供风扇名</strong>（<code>fan*_label</code> 全空），也<strong>无法从硬件区分哪个是 CPU 风扇</strong>
+（实测压转速看温升，信号淹没在噪声里）。所以只能用「测试识别」听声后手动命名。</p>
+<p><strong>Q：想同时跟主板温度和 CPU 温度？</strong>
+做不到 —— 单通道的 <code>temp_sel</code> 只能选一路。把 CPU 风扇和机箱风扇分到不同通道，
+各跟一路即可。</p>
+<p><strong>Q：改了名字，概要页没变化？</strong>
+概要按「显示」设置过滤：若该通道是 <code>自动显示</code> 且转速为 0，就不列出。
+把它设为 <code>始终显示</code>。</p>
+<p><strong>Q：<code>pve-hwtools-agent set</code> 报「未知配置项」？</strong>
+配置键有白名单校验。<code>show_*</code> / <code>block_*</code> / <code>governor</code> / <code>freq_*</code> / <code>turbo</code> / <code>epp</code> /
+<code>apt_mirror</code> / <code>fan*</code> / <code>show_fanch_*</code> 之外一律拒绝。整批参数里<strong>任一非法则一条都不生效</strong>。</p>
+<p><strong>Q：面板保存提示 500 / 报 <code>command ... failed</code>？</strong>
+多半是参数没过校验。整批参数任一非法则全部不写，配置保持原样——不会写坏。</p>
+<p><strong>Q：PVE 大版本升级后功能消失？</strong>
+apt 钩子没挂上。检查 <code>apt-config dump | grep -i post-invoke</code>，
+或升级后手工跑一次 <code>/usr/local/bin/pve-hwpatch.sh</code>。
+若锚点失配（PVE 改了 <code>StatusView</code> 结构），脚本会自己报错并回滚，不会把面板改坏。</p>
+<hr>
+</div>

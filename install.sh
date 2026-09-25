@@ -22,12 +22,18 @@
 # 由 pve-hwpatch.sh 自行落盘（无需手工放）：
 #   /usr/bin/s.sh、/usr/local/lib/pve-hwtools/cpu-model.sh、
 #   /etc/default/pve-hwtools、/etc/systemd/system/pve-hwtools-apply.service
+# 使用说明（面板里「使用说明」按钮弹出的那份）：
+#   /usr/local/lib/pve-hwtools/doc.html —— 来自仓库的 pve-hwtools-doc.html；
+#   在 git 工作副本里若装了 python-markdown，则改由 tools/mkdoc.py 从 README.md 现生成。
 
 set -u
 
 REPO="sanqianxingluo/pve-panel-patches"
 REF="${PVE_HWTOOLS_REF:-main}"
 FILES="pve-hwpatch.sh pve-hwtools-agent pve-nosub-patch.sh pve-mirror-switch.sh"
+# 说明书是数据文件（不执行），单独下载：不进 FILES 的语法检查与 SHA256 清单，
+# 缺了只影响面板上那个按钮，不该让整个安装失败。
+DOCFILE="pve-hwtools-doc.html"
 DEST=/usr/local/bin
 HWDEST=/usr/local/lib/pve-hwtools
 BK=/root/pve-upgrade-backup
@@ -70,6 +76,8 @@ pve-hwtools-install.sh —— PVE 面板补丁集 一键部署 / 卸载
 由 pve-hwpatch.sh 自行落盘（无需手工放）：
   /usr/bin/s.sh、/usr/local/lib/pve-hwtools/cpu-model.sh、
   /etc/default/pve-hwtools、/etc/systemd/system/pve-hwtools-apply.service
+使用说明（面板「使用说明」按钮弹出的那份）：
+  /usr/local/lib/pve-hwtools/doc.html —— 来自仓库的 pve-hwtools-doc.html
 
 卸载不会删除 /etc/default/pve-hwtools 与 /root/pve-upgrade-backup（留作回退）。
 USAGE
@@ -159,7 +167,7 @@ PY
   rm -f /usr/bin/s.sh
   rm -rf "$HWDEST"
   find /usr/share/pve-manager /usr/share/perl5 -name '*.orig.hwpatch' -delete 2>/dev/null || true
-  say "    已删三个补丁脚本 + /usr/bin/s.sh + $HWDEST"
+  say "    已删四个补丁脚本 + /usr/bin/s.sh + $HWDEST（含使用说明 doc.html）"
 
   say "[6] 重启服务"
   systemctl restart pvedaemon pveproxy 2>/dev/null || true
@@ -190,6 +198,12 @@ else
     curl -fsSL "$RAW/$f" -o "$SRC/$f" || die "下载失败：$RAW/$f（检查网络，或先 git clone 再本地运行）"
     say "    ↓ $f"
   done
+  # 说明书：非必需，下载不到只警告（面板那个按钮会提示缺文件）
+  if curl -fsSL "$RAW/$DOCFILE" -o "$SRC/$DOCFILE" 2>/dev/null; then
+    say "    ↓ $DOCFILE"
+  else
+    say "    （$DOCFILE 未取到，面板「使用说明」按钮将不可用）"
+  fi
   # 有 SHA256SUMS 就核对，防截断/篡改
   if curl -fsSL "$RAW/SHA256SUMS" -o "$SRC/SHA256SUMS" 2>/dev/null; then
     if (cd "$SRC" && sha256sum -c --quiet SHA256SUMS 2>/dev/null); then
@@ -232,6 +246,25 @@ for f in $FILES; do
   install -m 755 "$SRC/$f" "$DEST/$f" || die "安装 $f 失败"
   say "    $DEST/$f"
 done
+
+# 3b) 使用说明（面板「使用说明」按钮弹出的那份）
+#     在 git 工作副本里若装了 python-markdown，就从 README.md 现生成 ——
+#     保证面板里的说明永远和仓库 README 同源，不会各改各的。
+say "    使用说明 -> $HWDEST/doc.html"
+mkdir -p "$HWDEST"
+DOCSRC=""
+if [ -f "$SRC/tools/mkdoc.py" ] && [ -f "$SRC/README.md" ]; then
+  if (cd "$SRC" && python3 tools/mkdoc.py >/dev/null 2>&1) && [ -s "$SRC/$DOCFILE" ]; then
+    DOCSRC="$SRC/$DOCFILE"
+    say "    （已由 tools/mkdoc.py 从 README.md 现生成）"
+  fi
+fi
+[ -n "$DOCSRC" ] || DOCSRC="$SRC/$DOCFILE"
+if [ -f "$DOCSRC" ] && [ -s "$DOCSRC" ]; then
+  install -m 644 "$DOCSRC" "$HWDEST/doc.html"
+else
+  say "    ⚠ 没取到 $DOCFILE —— 面板「使用说明」按钮将提示缺文件（其余功能不受影响）"
+fi
 
 # 4) apt 钩子
 step "[4/7] 挂 apt 钩子（升级后自动重打）"
@@ -276,6 +309,7 @@ chk "CPU 世代映射就位"    "[ -f $HWDEST/cpu-model.sh ]"
 chk "配置 /etc/default/pve-hwtools 就位" "[ -f /etc/default/pve-hwtools ]"
 chk "后端已注入 Nodes.pm" "grep -q PVE_HWAPI /usr/share/perl5/PVE/API2/Nodes.pm"
 chk "前端已注入 pvemanagerlib.js" "grep -q 'PVE_HWUI:BEGIN' /usr/share/pve-manager/js/pvemanagerlib.js"
+chk "使用说明 doc.html 就位" "[ -s $HWDEST/doc.html ]"
 chk "pvedaemon 正常"      "systemctl is-active --quiet pvedaemon"
 chk "pveproxy 正常"       "systemctl is-active --quiet pveproxy"
 
