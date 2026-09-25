@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V2.7
+# 版本：V2.8
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -1193,14 +1193,31 @@ Ext.define('PVE.node.HwTools', {
             var fs = me.down('#fanfs');
             if (!fs) { return; }
             var fans = d.fans || [];
+            // 芯片给的标签（PECI Agent 0 / AUXTIN0）没人看得懂，后端已翻成人话。
+            // 「推荐」= 该路真的代表 CPU 温度；没接传感器的 AUXTIN 一律排后面并标注，
+            // 免得选了个空脚（风扇就不会跟任何温度走了）。
             var sources = (d.fan_sources || []).map(function (x) {
-                return { v: x.n + ' · ' + x.label, val: String(x.n) };
+                var rec = x.rec ? (' ' + gettext('（推荐）')) : '';
+                var dead = (x.role === 'aux') ? (' ' + gettext('（未接）')) : '';
+                return {
+                    v: x.human + rec + dead + ' · ' + (x.temp / 1000).toFixed(1) + ' °C',
+                    val: String(x.n),
+                    human: x.human, role: x.role, rec: x.rec || 0, temp: x.temp || 0,
+                };
+            }).sort(function (a, b) {
+                if ((a.rec ? 1 : 0) !== (b.rec ? 1 : 0)) { return b.rec - a.rec; }
+                if ((a.role === 'aux' ? 1 : 0) !== (b.role === 'aux' ? 1 : 0)) {
+                    return (a.role === 'aux' ? 1 : 0) - (b.role === 'aux' ? 1 : 0);
+                }
+                return Number(a.val) - Number(b.val);
             });
             var hint = me.down('#fanhint');
             if (hint) {
                 hint.setHtml('<span style="color:#888">' +
                     (fans.length
-                        ? (gettext('共 ') + fans.length + gettext(' 个通道。自动 = 交给主板硬件按曲线调速（无需常驻程序）；手动 = 固定占空比。曲线五点须按温度由低到高。'))
+                        ? (gettext('共 ') + fans.length + gettext(' 个通道。自动 = 交给主板硬件按曲线调速（无需常驻程序）；手动 = 固定占空比。曲线五点须按温度由低到高。') +
+                           '<br/>' + gettext('「跟哪路温度」决定该通道随哪一路温度升降 —— CPU 风扇选「CPU 核心温度」，机箱风扇可跟「主板温度」。括号里的数值是当前读数。') +
+                           '<br/>' + gettext('模式为「关闭（用主板设置）」时，该列显示的是主板当前实际在跟的温度源；要改需先切到「自动曲线」。'))
                         : gettext('本机未检测到可控风扇通道。')) + '</span>');
             }
             // 每次 reload 都重建：模式与曲线会变，旧控件留着会读到过期值
@@ -1239,11 +1256,12 @@ Ext.define('PVE.node.HwTools', {
                           emptyText: gettext('占空比'), minValue: 1, maxValue: 255,
                           value: f.manual || 128, allowBlank: false,
                           listeners: { change: function () { me.fanSyncRow(n); } } },
-                        { name: 'fan' + n + '_sel', xtype: 'combo', width: 168,
+                        { name: 'fan' + n + '_sel', xtype: 'combo', width: 232,
                           hideLabel: true, editable: false, forceSelection: true,
                           queryMode: 'local', displayField: 'v', valueField: 'val',
-                          emptyText: gettext('温度源'), store: { fields: ['v', 'val'], data: sources },
-                          value: String(f.sel || '') },
+                          emptyText: gettext('跟哪路温度'),
+                          store: { fields: ['v', 'val'], data: sources },
+                          value: String((f.mode === 'off' ? (f.sel_live !== undefined ? f.sel_live : f.sel) : f.sel) || '') },
                         { name: 'fan' + n + '_name', xtype: 'textfield', width: 130,
                           hideLabel: true, emptyText: gettext('名字（可留空）'),
                           value: PVE.HW.dec(f.name || '') },

@@ -1,5 +1,5 @@
 #!/bin/bash
-# pve-hwtools-agent —— PVE 工具集状态代理（V2.7）
+# pve-hwtools-agent —— PVE 工具集状态代理（V2.8）
 #
 # 唯一的配置真相：/etc/default/pve-hwtools
 # 职责：读/写该配置；施加 CPU 调频；按配置触发界面重渲染。
@@ -674,7 +674,7 @@ fan_status_json() {
   local n d out=""
   d=$(nct_dir) 2>/dev/null || { printf '[]'; return; }
   for n in $(fan_channels); do
-    local mode sel man curve en pwm rpm show nm
+    local mode sel man curve en pwm rpm show nm sel_live
     eval "nm=\${FAN${n}_NAME:-}"
     eval "mode=\${FAN${n}_MODE:-off}"
     eval "sel=\${FAN${n}_SEL:-2}"
@@ -683,8 +683,11 @@ fan_status_json() {
     eval "show=\${SHOW_FANCH_${n}:-${FANCH_SHOW_DEFAULT:-auto}}"
     en=$(cat "$d/pwm${n}_enable" 2>/dev/null || echo -1)
     pwm=$(cat "$d/pwm${n}" 2>/dev/null || echo -1)
+    # 内核实际在跟的温度源：模式为 off 时它才是真相（配置里的 sel 只是「切到自动后才用」），
+    # 两者可能不同——不报出来，界面就会显示一个并未生效的值，误导人。
+    sel_live=$(cat "$d/pwm${n}_temp_sel" 2>/dev/null || echo 0)
     rpm=$(fan_rpm "$n")
-    out="$out{\"n\":$n,\"rpm\":$rpm,\"enable\":$en,\"pwm\":$pwm,\"mode\":\"$mode\",\"sel\":$sel,\"manual\":$man,\"curve\":\"$curve\",\"show\":\"$show\",\"name\":\"$(url_encode "$nm")\"},"
+    out="$out{\"n\":$n,\"rpm\":$rpm,\"enable\":$en,\"pwm\":$pwm,\"mode\":\"$mode\",\"sel\":$sel,\"sel_live\":$sel_live,\"manual\":$man,\"curve\":\"$curve\",\"show\":\"$show\",\"name\":\"$(url_encode "$nm")\"},"
   done
   printf '[%s]' "${out%,}"
 }
@@ -692,12 +695,46 @@ fan_status_json() {
 # JSON 字符串转义（标签里可能有引号或反斜杠）
 json_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
+# ── 温度源的人话翻译 ──
+# 芯片给的名字（PECI Agent 0 / AUXTIN0 / PCH_CHIP_TEMP）用户看不懂，也不知道该选哪个。
+# 按「代表哪里的温度 + 是否推荐」翻译一遍：
+#   PECI / CPUTIN = CPU 温度，推荐（PECI 是 CPU 硅片自身温度，最准）
+#   SYSTIN        = 主板温度（真正的「主板温度」）
+#   PCH_*         = 芯片组
+#   AUXTIN*       = 绝大多数主板未接传感器，选它等于风扇不跟任何东西走
+fan_temp_role() {   # $1=芯片标签
+  case "$1" in
+    *PECI*)   printf 'cpu|1' ;;   # CPU 核心（最准）
+    *CPUTIN*) printf 'cpu|1' ;;   # CPU 插座
+    *SYSTIN*) printf 'sys|0' ;;   # 主板
+    *PCH*)    printf 'pch|0' ;;   # 芯片组
+    *)        printf 'aux|0' ;;   # 多半是空脚
+  esac
+}
+
+fan_temp_human() {  # $1=芯片标签 → 人话
+  case "$1" in
+    *PECI*)   printf 'CPU 核心温度' ;;
+    *CPUTIN*) printf 'CPU 插座温度' ;;
+    *SYSTIN*) printf '主板温度' ;;
+    *PCH_CHIP_CPU_MAX_TEMP*) printf '芯片组（CPU 端）' ;;
+    *PCH_CHIP_TEMP*) printf '芯片组' ;;
+    *PCH_CPU_TEMP*)  printf '芯片组（CPU 侧）' ;;
+    *PCH_MCH_TEMP*)  printf '芯片组（内存侧）' ;;
+    AUXTIN*)  printf '未接传感器' ;;
+    *)        printf '%s' "$1" ;;
+  esac
+}
+
 fan_sources_json() {
-  local line n lbl out=""
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    n="${line%%|*}"; lbl="${line#*|}"
-    out="$out{\"n\":${n},\"label\":\"$(json_esc "$lbl")\"},"
+  local line n lbl v role rec human out=""
+  while IFS='|' read -r n lbl; do
+    [ -n "$n" ] || continue
+    v=$(cat "$(nct_dir)/temp${n}_input" 2>/dev/null || echo 0)
+    local rr; rr=$(fan_temp_role "$lbl")
+    role="${rr%%|*}"; rec="${rr##*|}"
+    human=$(fan_temp_human "$lbl")
+    out="$out{\"n\":${n},\"label\":\"$(json_esc "$lbl")\",\"human\":\"$(json_esc "$human")\",\"role\":\"$role\",\"rec\":$rec,\"temp\":$v},"
   done <<EOF
 $(fan_temp_sources)
 EOF
