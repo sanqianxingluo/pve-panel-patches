@@ -1,5 +1,5 @@
 #!/bin/bash
-# pve-hwtools-agent —— PVE 工具集状态代理（V2.2）
+# pve-hwtools-agent —— PVE 工具集状态代理（V2.4）
 #
 # 唯一的配置真相：/etc/default/pve-hwtools
 # 职责：读/写该配置；施加 CPU 调频；按配置触发界面重渲染。
@@ -36,6 +36,14 @@ defaults() {
   CPU_TURBO=1
   CPU_EPP=balance_performance
   APT_MIRROR=ustc
+  # 风扇控制：默认全 off —— 不改变主板原有策略
+  FAN1_MODE=off; FAN1_SEL=2; FAN1_MANUAL=128; FAN1_CURVE=25:30,30:60,45:120,60:200,80:255
+  FAN2_MODE=off; FAN2_SEL=2; FAN2_MANUAL=128; FAN2_CURVE=30:30,40:60,55:120,70:180,80:255
+  FAN3_MODE=off; FAN3_SEL=2; FAN3_MANUAL=128; FAN3_CURVE=25:30,30:60,45:120,60:200,80:255
+  FAN4_MODE=off; FAN4_SEL=2; FAN4_MANUAL=128; FAN4_CURVE=25:30,30:60,45:120,60:200,80:255
+  FAN5_MODE=off; FAN5_SEL=2; FAN5_MANUAL=128; FAN5_CURVE=25:30,30:60,45:120,60:200,80:255
+  FAN6_MODE=off; FAN6_SEL=2; FAN6_MANUAL=128; FAN6_CURVE=25:30,30:60,45:120,60:200,80:255
+  FAN7_MODE=off; FAN7_SEL=2; FAN7_MANUAL=128; FAN7_CURVE=25:30,30:60,45:120,60:200,80:255
 }
 
 # 把可能是历史 kHz 写法的值折算成 MHz（>10000 视为 kHz）
@@ -141,11 +149,242 @@ else
   cpu_gen()    { printf '%s family %s model %s' "$(cpu_vendor)" "$(cpu_fam)" "$(cpu_mod)"; }
 fi
 
+# ---------- 风扇控制 ----------
+# 硬件：NCT6798D（nct6775 驱动）。能力已实测（2026-09-24）：
+#   pwmN_enable 语义：0=全速 1=手动定值 2=温度巡航 3=转速巡航 5=SmartFanIV（硬件曲线）
+#                    4=SmartFanIII 在本芯片上被驱动拒绝（6798 只有 IV）
+#   五个曲线点 writeable，温度单位毫摄氏度、占空比 0-255。硬件自动执行，**无需守护进程**。
+#
+# 安全设计（这块是能烧硬件的，务必守）：
+#   * 默认 MODE=off —— 什么都不动，沿用主板自己的策略。装上本补丁不会改变风扇行为。
+#   * 首次碰某通道前，把它**全部原始值**存进 $FANBASE（每通道一份），MODE=off 即按此还原。
+#   * 施加后 3 秒复读转速：原本在转、现在变 0 → **立即还原并报错**（防写错把风扇弄停）。
+#   * 手动值下限强制 >= $FAN_PWM_MIN，绝不写 0。
+FANBASE=/usr/local/lib/pve-hwtools/fan-baseline
+FAN_PWM_MIN=1          # 手动占空比下限（0=停转，一律禁止）
+
+# nct 芯片所在的 hwmon 目录——**必须按名字现找**，hwmon 序号会随内核/设备变动而变
+nct_dir() {
+  local h n
+  for h in /sys/class/hwmon/hwmon*; do
+    [ -r "$h/name" ] || continue
+    n=$(cat "$h/name" 2>/dev/null)
+    case "$n" in nct6775|nct6776|nct6779|nct6791|nct6792|nct6793|nct6795|nct6796|nct6797|nct6798|nct6683|nct6686|nct6687)
+      printf '%s' "$h"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# 本机存在的 pwm 通道号（形如 "1 2 3 4 5 7"）
+fan_channels() {
+  local d; d=$(nct_dir) || return 0
+  local f n out=""
+  for f in "$d"/pwm[0-9]*; do
+    [ -e "$f" ] || continue
+    n=$(basename "$f"); n=${n#pwm}
+    case "$n" in *[!0-9]*) continue ;; esac
+    case " $out " in *" $n "*) ;; *) out="$out $n" ;; esac
+  done
+  printf '%s' "${out# }"
+}
+
+fan_rpm()  { local d; d=$(nct_dir) || { printf '0'; return; }; cat "$d/fan${1}_input" 2>/dev/null || printf '0'; }
+fan_enable(){ local d; d=$(nct_dir) || return; cat "$d/pwm${1}_enable" 2>/dev/null; }
+fan_temp_sel(){ local d; d=$(nct_dir) || return; cat "$d/pwm${1}_temp_sel" 2>/dev/null; }
+
+# 可选温度源：只保留读数为 0 以外、且标签不像 AUXTIN 空脚的
+fan_temp_sources() {
+  local d; d=$(nct_dir) || return 0
+  local t n lbl v out=""
+  for t in "$d"/temp[0-9]*_input; do
+    [ -e "$t" ] || continue
+    n=$(basename "$t"); n=${n#temp}; n=${n%_input}
+    v=$(cat "$t" 2>/dev/null || echo 0)
+    # 跳过明显无效的空脚（读数为 0）
+    [ "$v" -gt 0 ] 2>/dev/null || continue
+    lbl=$(cat "$d/temp${n}_label" 2>/dev/null)
+    [ -n "$lbl" ] || lbl="temp$n"
+    # 每行一条「编号|标签」。**不能**用空格分隔：标签形如 "PECI Agent 0" 会被拆碎。
+    printf '%s|%s\n' "$n" "$lbl"
+  done
+}
+
+# 保存通道原始状态（只在首次碰它时存，绝不覆盖）
+fan_save_baseline() {
+  local n="$1" d; d=$(nct_dir) || return 0
+  case "$n" in ''|*[!0-9]*) return 0 ;; esac   # 空/非法通道号直接不存，防生成 pwm.saved 空文件
+  mkdir -p "$FANBASE"
+  [ -f "$FANBASE/pwm${n}.saved" ] && return 0
+  {
+    for k in enable mode temp_sel floor start stop_time step_up_time step_down_time temp_tolerance; do
+      [ -e "$d/pwm${n}_${k}" ] && printf '%s=%s\n' "$k" "$(cat "$d/pwm${n}_${k}" 2>/dev/null)"
+    done
+    [ -e "$d/pwm${n}" ] && printf 'pwm=%s\n' "$(cat "$d/pwm${n}" 2>/dev/null)"
+    for p in 1 2 3 4 5; do
+      [ -e "$d/pwm${n}_auto_point${p}_temp" ] && printf 'point%s_temp=%s\n' "$p" "$(cat "$d/pwm${n}_auto_point${p}_temp" 2>/dev/null)"
+      [ -e "$d/pwm${n}_auto_point${p}_pwm" ]  && printf 'point%s_pwm=%s\n'  "$p" "$(cat "$d/pwm${n}_auto_point${p}_pwm" 2>/dev/null)"
+    done
+  } > "$FANBASE/pwm${n}.saved"
+}
+
+# 按基线还原某通道
+fan_restore_baseline() {
+  local n="$1" d f; d=$(nct_dir) || return 0
+  [ -f "$FANBASE/pwm${n}.saved" ] || return 0
+  while IFS='=' read -r k v; do
+    [ -n "$k" ] || continue
+    case "$k" in
+      enable|mode|temp_sel|floor|start|stop_time|step_up_time|step_down_time|temp_tolerance) f="$d/pwm${n}_${k}" ;;
+      pwm) f="$d/pwm${n}" ;;
+      point*temp)  f="$d/pwm${n}_auto_${k%_temp}_temp" ;;
+      point*pwm)   f="$d/pwm${n}_auto_${k%_pwm}_pwm" ;;
+      *) continue ;;
+    esac
+    [ -e "$f" ] && printf '%s' "$v" > "$f" 2>/dev/null
+  done < "$FANBASE/pwm${n}.saved"
+  return 0
+}
+
+# 校验曲线：形如 25:30,30:60,45:120,60:200,80:255 —— 恰 5 点，温度严格升序，占空比 1~255
+valid_curve() {
+  local v="$1" pts t w prev=-1 n=0 out=""
+  IFS=',' read -ra pts <<< "$v"
+  [ "${#pts[@]}" = 5 ] || die "曲线必须是 5 个点（温度:占空比，逗号分隔），现为 ${#pts[@]} 个"
+  for p in "${pts[@]}"; do
+    t="${p%%:*}"; w="${p##*:}"
+    case "$t" in ''|*[!0-9]*) die "曲线温度必须是整数摄氏度：$p" ;; esac
+    case "$w" in ''|*[!0-9]*) die "曲线占空比必须是整数：$p" ;; esac
+    [ "$t" -ge 0 ] && [ "$t" -le 120 ] || die "曲线温度应在 0~120℃：$p"
+    [ "$w" -ge "$FAN_PWM_MIN" ] && [ "$w" -le 255 ] || die "曲线占空比应在 $FAN_PWM_MIN~255：$p"
+    [ "$t" -gt "$prev" ] || die "曲线温度必须严格递增（前一点 $prev，当前 $t）"
+    prev=$t; n=$((n+1))
+    out="$out$t:$w,"
+  done
+  VALID="${out%,}"
+}
+
+valid_fan_mode() { case "$1" in off|auto|manual) VALID="$1" ;; *) die "风扇模式只能是 off / auto / manual：$1" ;; esac; }
+
+# 通道必须真实存在——否则写进配置也毫无作用，只会让人误以为设好了
+valid_fan_channel() {
+  local v="$1" n
+  case "$v" in ''|*[!0-9]*) die "风扇通道号不合法：$v" ;; esac
+  for n in $(fan_channels); do [ "$n" = "$v" ] && { VALID="$v"; return 0; }; done
+  die "本机没有风扇通道 $v。可用：$(fan_channels | tr ' ' ' ')"
+}
+valid_fan_sel() {
+  local v="$1" line ok=0
+  case "$v" in ''|*[!0-9]*) die "温度源编号必须是整数：$v" ;; esac
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ "${line%%|*}" = "$v" ] && ok=1
+  done <<EOF
+$(fan_temp_sources)
+EOF
+  [ "$ok" = 1 ] || die "无此温度源：temp$v。可用：$(fan_temp_sources | tr '\n' ' ' | sed 's/|/=/g')"
+  VALID="$v"
+}
+valid_pwm() {
+  local v="$1"
+  case "$v" in ''|*[!0-9]*) die "占空比必须是整数：$v" ;; esac
+  [ "$v" -ge "$FAN_PWM_MIN" ] && [ "$v" -le 255 ] || die "占空比应在 $FAN_PWM_MIN~255（0 会停转，禁止）：$v"
+  VALID="$v"
+}
+
+# 施加单个通道
+fan_apply_one() {   # $1=通道号
+  local n="$1" d; d=$(nct_dir) || return 0
+  local var="FAN${n}"
+  local mode; eval "mode=\${${var}_MODE:-off}"
+  local sel;  eval "sel=\${${var}_SEL:-2}"
+  local man;  eval "man=\${${var}_MANUAL:-128}"
+  local curve; eval "curve=\${${var}_CURVE:-}"
+
+  local before; before=$(fan_rpm "$n")
+  fan_save_baseline "$n"
+
+  case "$mode" in
+    off)
+      fan_restore_baseline "$n"
+      return 0 ;;
+    manual)
+      [ -e "$d/pwm${n}" ] && printf '%s' "$man" > "$d/pwm${n}" 2>/dev/null
+      [ -e "$d/pwm${n}_enable" ] && printf '1' > "$d/pwm${n}_enable" 2>/dev/null
+      ;;
+    auto)
+      [ -e "$d/pwm${n}_temp_sel" ] && printf '%s' "$sel" > "$d/pwm${n}_temp_sel" 2>/dev/null
+      local i=1 p t w
+      IFS=',' read -ra PTS <<< "$curve"
+      for p in "${PTS[@]}"; do
+        t="${p%%:*}"; w="${p##*:}"
+        [ -e "$d/pwm${n}_auto_point${i}_temp" ] && printf '%s' "$(( t * 1000 ))" > "$d/pwm${n}_auto_point${i}_temp" 2>/dev/null
+        [ -e "$d/pwm${n}_auto_point${i}_pwm" ]  && printf '%s' "$w" > "$d/pwm${n}_auto_point${i}_pwm" 2>/dev/null
+        i=$((i+1))
+      done
+      # enable=5 最后写：先把曲线铺好，再交给硬件，避免中途以半截曲线运行
+      [ -e "$d/pwm${n}_enable" ] && printf '5' > "$d/pwm${n}_enable" 2>/dev/null
+      ;;
+  esac
+
+  # 安全阀：原本在转、写完变 0 → 立即还原（可能是写错了通道或占空比过低）
+  sleep 3
+  local after; after=$(fan_rpm "$n")
+  if [ "$before" -gt 0 ] && [ "$after" = 0 ]; then
+    fan_restore_baseline "$n"
+    die "风扇 $n 施加后停转（原 $before RPM → 0），已还原原状。请检查占空比/温度源。"
+  fi
+  return 0
+}
+
+fan_apply_all() {
+  local n
+  nct_dir >/dev/null 2>&1 || return 0     # 没有 nct 芯片就静静跳过
+  for n in $(fan_channels); do fan_apply_one "$n"; done
+  return 0
+}
+
+# 状态输出：每个通道一行 JSON 片段
+fan_status_json() {
+  local n d out=""
+  d=$(nct_dir) 2>/dev/null || { printf '[]'; return; }
+  for n in $(fan_channels); do
+    local mode sel man curve en pwm rpm
+    eval "mode=\${FAN${n}_MODE:-off}"
+    eval "sel=\${FAN${n}_SEL:-2}"
+    eval "man=\${FAN${n}_MANUAL:-128}"
+    eval "curve=\${FAN${n}_CURVE:-25:30,30:60,45:120,60:200,80:255}"
+    en=$(cat "$d/pwm${n}_enable" 2>/dev/null || echo -1)
+    pwm=$(cat "$d/pwm${n}" 2>/dev/null || echo -1)
+    rpm=$(fan_rpm "$n")
+    out="$out{\"n\":$n,\"rpm\":$rpm,\"enable\":$en,\"pwm\":$pwm,\"mode\":\"$mode\",\"sel\":$sel,\"manual\":$man,\"curve\":\"$curve\"},"
+  done
+  printf '[%s]' "${out%,}"
+}
+
+# JSON 字符串转义（标签里可能有引号或反斜杠）
+json_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+fan_sources_json() {
+  local line n lbl out=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    n="${line%%|*}"; lbl="${line#*|}"
+    out="$out{\"n\":${n},\"label\":\"$(json_esc "$lbl")\"},"
+  done <<EOF
+$(fan_temp_sources)
+EOF
+  printf '[%s]' "${out%,}"
+}
+
 # ---------- 校验 ----------
+# 说明：这些 valid_* 一律「把结果写进全局 VALID」而非 printf，调用方**直接调用**再读 $VALID。
+# 原因：`X=$(valid_...)` 会把函数放进子 shell，里面 die → exit 1 只能杀掉子 shell，
+# 父进程照旧往下走，于是非法输入会「打印了错误却仍然写配置」。这个坑必须避开。
 valid_gov() {
   local v="$1" g
   for g in $(gov_list | tr ',' ' '); do
-    [ "$g" = "$v" ] && { printf '%s' "$v"; return 0; }
+    [ "$g" = "$v" ] && { VALID="$v"; return 0; }
   done
   die "不支持的调频模式「$v」。本机可用：$(gov_list | tr ',' ' ')"
 }
@@ -157,21 +396,21 @@ valid_freq_mhz() {
   hmin=$(( $(hw_min_khz) / 1000 )); hmax=$(( $(hw_max_khz) / 1000 ))
   [ "$mhz" -lt "$hmin" ] && die "频率 $mhz MHz 低于硬件下限 $hmin MHz"
   [ "$mhz" -gt "$hmax" ] && die "频率 $mhz MHz 高于硬件上限 $hmax MHz"
-  printf '%s' "$(( mhz * 1000 ))"
+  VALID="$(( mhz * 1000 ))"
 }
-valid_01() { case "$1" in 0|1) printf '%s' "$1" ;; *) die "开关只能是 0 或 1：$1" ;; esac; }
+valid_01() { case "$1" in 0|1) VALID="$1" ;; *) die "开关只能是 0 或 1：$1" ;; esac; }
 # 镜像代号：必须是切换脚本自报的可用项之一（既是校验，也挡住 shell 注入）
 valid_mirror() {
   local v="$1" m
   [ -x "$MIRROR" ] || die "找不到镜像切换脚本 $MIRROR"
   for m in $("$MIRROR" list 2>/dev/null | awk '/^  [a-z]/ {print $1}'); do
-    [ "$m" = "$v" ] && { printf '%s' "$v"; return 0; }
+    [ "$m" = "$v" ] && { VALID="$v"; return 0; }
   done
   die "未知镜像「$v」。可用：$("$MIRROR" list 2>/dev/null | awk '/^  [a-z]/ {print $1}' | tr '\n' ' ')"
 }
 valid_epp() {
   local v="$1" g
-  for g in $(epp_names); do [ "$g" = "$v" ] && { printf '%s' "$v"; return 0; }; done
+  for g in $(epp_names); do [ "$g" = "$v" ] && { VALID="$v"; return 0; }; done
   die "不支持的能效偏好「$v」。本机可用：$(epp_names | tr '\n' ' ')"
 }
 
@@ -202,6 +441,40 @@ CPU_EPP=$CPU_EPP
 # 软件源镜像（切换脚本见 /usr/local/bin/pve-mirror-switch.sh）
 #   可选：ustc 中科大 / tuna 清华 / aliyun 阿里云 / tencent 腾讯云 / huawei 华为云 / official 官方源
 APT_MIRROR=$APT_MIRROR
+#
+# 风扇控制（默认 off = 不改动主板原有策略；auto = 硬件曲线，无需守护进程）
+#   FANn_MODE   off / auto / manual
+#   FANn_SEL    温度源编号（见接口返回的 fan_sources，2=CPUTIN、8=PECI）
+#   FANn_MANUAL 手动占空比 1~255
+#   FANn_CURVE  五个点，温度:占空比，温度须严格递增
+FAN1_MODE=$FAN1_MODE
+FAN1_SEL=$FAN1_SEL
+FAN1_MANUAL=$FAN1_MANUAL
+FAN1_CURVE=$FAN1_CURVE
+FAN2_MODE=$FAN2_MODE
+FAN2_SEL=$FAN2_SEL
+FAN2_MANUAL=$FAN2_MANUAL
+FAN2_CURVE=$FAN2_CURVE
+FAN3_MODE=$FAN3_MODE
+FAN3_SEL=$FAN3_SEL
+FAN3_MANUAL=$FAN3_MANUAL
+FAN3_CURVE=$FAN3_CURVE
+FAN4_MODE=$FAN4_MODE
+FAN4_SEL=$FAN4_SEL
+FAN4_MANUAL=$FAN4_MANUAL
+FAN4_CURVE=$FAN4_CURVE
+FAN5_MODE=$FAN5_MODE
+FAN5_SEL=$FAN5_SEL
+FAN5_MANUAL=$FAN5_MANUAL
+FAN5_CURVE=$FAN5_CURVE
+FAN6_MODE=$FAN6_MODE
+FAN6_SEL=$FAN6_SEL
+FAN6_MANUAL=$FAN6_MANUAL
+FAN6_CURVE=$FAN6_CURVE
+FAN7_MODE=$FAN7_MODE
+FAN7_SEL=$FAN7_SEL
+FAN7_MANUAL=$FAN7_MANUAL
+FAN7_CURVE=$FAN7_CURVE
 EOF
   chmod 644 "$CONF"
 }
@@ -266,7 +539,7 @@ emit_status() {
   je="${je%,}"
   local base; base=$(base_khz)
   cat <<EOF
-{"show_cpu_temp":$SHOW_CPU_TEMP,"show_fan":$SHOW_FAN,"show_disk":$SHOW_DISK,"show_cpu_freq":$SHOW_CPU_FREQ,"block_subscription":$BLOCK_SUBSCRIPTION_PROMPT,"governor":"$CPU_GOVERNOR","governors":[$jg],"freq_min":$CPU_FREQ_MIN,"freq_max":$CPU_FREQ_MAX,"governor_live":"$(live_gov)","freq_min_live":$(( $(live_min) / 1000 )),"freq_max_live":$(( $(live_max) / 1000 )),"freq_cur":$(( $(live_cur) / 1000 )),"freq_hw_min":$(( $(hw_min_khz) / 1000 )),"freq_hw_max":$(( $(hw_max_khz) / 1000 )),"base_freq":$(( base / 1000 )),"turbo":$(turbo_get),"turbo_avail":$(turbo_avail),"epp":"$(epp_cur)","epp_avail":$(epp_avail),"epp_list":[$je],"driver":"$(cpudriver)","amd_pstate":"$(apstate_status)","policies":$(policies | wc -l),"cpufreq_ok":$(cpufreq_ok && echo 1 || echo 0),"cpu_brand":"$(cpu_brand)","cpu_gen":"$(cpu_gen)","cpu_vendor":"$(cpu_vendor)","apt_mirror":"$APT_MIRROR","apt_mirror_live":"$(if [ -x "$MIRROR" ]; then "$MIRROR" status 2>/dev/null | sed -n 's/.*"apt_mirror_detected":"\([^"]*\)".*/\1/p'; fi)","mirror_list":"$(if [ -x "$MIRROR" ]; then "$MIRROR" list 2>/dev/null | awk '/^  [a-z]/ {print $1}' | tr '\n' ','; fi)","apt_mirror_avail":$([ -x "$MIRROR" ] && echo true || echo false),"config_file":"$CONF"}
+{"show_cpu_temp":$SHOW_CPU_TEMP,"show_fan":$SHOW_FAN,"show_disk":$SHOW_DISK,"show_cpu_freq":$SHOW_CPU_FREQ,"block_subscription":$BLOCK_SUBSCRIPTION_PROMPT,"governor":"$CPU_GOVERNOR","governors":[$jg],"freq_min":$CPU_FREQ_MIN,"freq_max":$CPU_FREQ_MAX,"governor_live":"$(live_gov)","freq_min_live":$(( $(live_min) / 1000 )),"freq_max_live":$(( $(live_max) / 1000 )),"freq_cur":$(( $(live_cur) / 1000 )),"freq_hw_min":$(( $(hw_min_khz) / 1000 )),"freq_hw_max":$(( $(hw_max_khz) / 1000 )),"base_freq":$(( base / 1000 )),"turbo":$(turbo_get),"turbo_avail":$(turbo_avail),"epp":"$(epp_cur)","epp_avail":$(epp_avail),"epp_list":[$je],"driver":"$(cpudriver)","amd_pstate":"$(apstate_status)","policies":$(policies | wc -l),"cpufreq_ok":$(cpufreq_ok && echo 1 || echo 0),"cpu_brand":"$(cpu_brand)","cpu_gen":"$(cpu_gen)","cpu_vendor":"$(cpu_vendor)","apt_mirror":"$APT_MIRROR","apt_mirror_live":"$(if [ -x "$MIRROR" ]; then "$MIRROR" status 2>/dev/null | sed -n 's/.*"apt_mirror_detected":"\([^"]*\)".*/\1/p'; fi)","mirror_list":"$(if [ -x "$MIRROR" ]; then "$MIRROR" list 2>/dev/null | awk '/^  [a-z]/ {print $1}' | tr '\n' ','; fi)","apt_mirror_avail":$([ -x "$MIRROR" ] && echo true || echo false),"fan_avail":$([ -n "$(nct_dir)" ] && echo true || echo false),"fan_channels":"$(fan_channels | tr ' ' ',')","fans":$(fan_status_json),"fan_sources":$(fan_sources_json),"fan_pwm_min":$FAN_PWM_MIN,"config_file":"$CONF"}
 EOF
 }
 
@@ -280,22 +553,39 @@ cmd_set() {
 
   local gov="$CPU_GOVERNOR" fmin="$CPU_FREQ_MIN" fmax="$CPU_FREQ_MAX"
   local turbo="$CPU_TURBO" epp="$CPU_EPP"
-  local freq_changed=0 other_changed=0 mirror_changed=0 kv k v
+  local freq_changed=0 other_changed=0 mirror_changed=0 fan_changed=0 kv k v
 
   for kv in "$@"; do
     k="${kv%%=*}"; v="${kv#*=}"
     case "$k" in
-      show_cpu_temp) SHOW_CPU_TEMP=$(valid_01 "$v") ;;
-      show_fan) SHOW_FAN=$(valid_01 "$v") ;;
-      show_disk) SHOW_DISK=$(valid_01 "$v") ;;
-      show_cpu_freq) SHOW_CPU_FREQ=$(valid_01 "$v") ;;
-      block_subscription) BLOCK_SUBSCRIPTION_PROMPT=$(valid_01 "$v") ;;
-      governor) gov=$(valid_gov "$v"); freq_changed=1 ;;
-      freq_min) fmin=$(( $(valid_freq_mhz "$v") / 1000 )); freq_changed=1 ;;
-      freq_max) fmax=$(( $(valid_freq_mhz "$v") / 1000 )); freq_changed=1 ;;
-      turbo) turbo=$(valid_01 "$v"); other_changed=1 ;;
-      epp) epp=$(valid_epp "$v"); other_changed=1 ;;
-      apt_mirror) APT_MIRROR=$(valid_mirror "$v") ; mirror_changed=1 ;;
+      show_cpu_temp) valid_01 "$v"; SHOW_CPU_TEMP=$VALID ;;
+      show_fan) valid_01 "$v"; SHOW_FAN=$VALID ;;
+      show_disk) valid_01 "$v"; SHOW_DISK=$VALID ;;
+      show_cpu_freq) valid_01 "$v"; SHOW_CPU_FREQ=$VALID ;;
+      block_subscription) valid_01 "$v"; BLOCK_SUBSCRIPTION_PROMPT=$VALID ;;
+      governor) valid_gov "$v"; gov=$VALID; freq_changed=1 ;;
+      freq_min) valid_freq_mhz "$v"; fmin=$(( VALID / 1000 )); freq_changed=1 ;;
+      freq_max) valid_freq_mhz "$v"; fmax=$(( VALID / 1000 )); freq_changed=1 ;;
+      turbo) valid_01 "$v"; turbo=$VALID; other_changed=1 ;;
+      epp) valid_epp "$v"; epp=$VALID; other_changed=1 ;;
+      apt_mirror) valid_mirror "$v"; APT_MIRROR=$VALID; mirror_changed=1 ;;
+      fan*_mode)
+        local fn="${k#fan}"; fn="${fn%_mode}"
+        valid_fan_channel "$fn"; fn=$VALID
+        fan_save_baseline "$fn"
+        valid_fan_mode "$v"; eval "FAN${fn}_MODE=\$VALID"; fan_changed=1 ;;
+      fan*_sel)
+        local fn="${k#fan}"; fn="${fn%_sel}"
+        valid_fan_channel "$fn"; fn=$VALID
+        valid_fan_sel "$v"; eval "FAN${fn}_SEL=\$VALID"; fan_changed=1 ;;
+      fan*_manual)
+        local fn="${k#fan}"; fn="${fn%_manual}"
+        valid_fan_channel "$fn"; fn=$VALID
+        valid_pwm "$v"; eval "FAN${fn}_MANUAL=\$VALID"; fan_changed=1 ;;
+      fan*_curve)
+        local fn="${k#fan}"; fn="${fn%_curve}"
+        valid_fan_channel "$fn"; fn=$VALID
+        valid_curve "$v"; eval "FAN${fn}_CURVE=\$VALID"; fan_changed=1 ;;
       *) die "未知配置项：$k" ;;
     esac
   done
@@ -312,6 +602,9 @@ cmd_set() {
   # 先生效；失败则不落盘（保证配置与系统状态一致）
   if [ "$freq_changed" = 1 ]; then apply_freq; fi
   if [ "$other_changed" = 1 ]; then apply_turbo; apply_epp; fi
+
+  # 风扇先施加：它有「停转即还原并报错」的安全阀，失败就该中止、配置不落盘
+  if [ "$fan_changed" = 1 ]; then fan_apply_all; fi
 
   write_conf
   if [ "$mirror_changed" = 1 ] && [ -x "$MIRROR" ]; then
@@ -332,6 +625,8 @@ cmd_apply() {
   if cpufreq_ok; then apply_freq 2>/dev/null || true; fi
   apply_turbo
   apply_epp
+  # 开机把风扇曲线也铺回去；出错只记日志，不让整个自启单元失败
+  fan_apply_all 2>/dev/null || true
   if [ -x "$RENDER" ]; then "$RENDER" >/dev/null 2>&1; fi
   emit_status
 }

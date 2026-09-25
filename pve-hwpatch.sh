@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V2.3
+# 版本：V2.4
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -65,7 +65,7 @@ CPU_TURBO=1
 # 能效偏好 EPP（仅部分新平台支持）
 CPU_EPP=balance_performance
 #
-# 软件源镜像：ustc 中科大 / tuna 清华 / aliyun 阿里云 / tencent 腾讯云 / huawei 华为云 / official 官方源
+ustc 中科大 / tuna 清华 / aliyun 阿里云 / tencent 腾讯云 / huawei 华为云 / official 官方源
 APT_MIRROR=ustc
 EOC
   chmod 644 "$CONF"; changed=1; echo "  [0] 已建 $CONF"
@@ -428,12 +428,19 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
         my @args;
-        for my $kv (split(/,/, $param->{values} // '')) {
+        # 分隔符是**空格**不是逗号：风扇曲线取值自带逗号（25:30,30:60,...），
+        # 按逗号切会把一条曲线拆成五段。前端各 k=v 之间以空格分隔。
+        for my $kv (split(/[ \t]+/, $param->{values} // '')) {
             $kv =~ s/^\\s+|\\s+$//g;
             next if $kv eq '';
             # 值的字符类**必须允许下划线**：EPP 档位名形如 balance_performance。
             # 只允许字母数字下划线点减号，杜绝 shell 元字符——防注入的同时不误伤合法取值。
-            die "非法参数：$kv\\n" if $kv !~ /^[a-z_]+=[0-9a-zA-Z_.-]+$/;
+            # 值的字符类必须允许：下划线（EPP 档位名 balance_performance）、
+            # 冒号与逗号（风扇曲线 25:30,30:60,45:120,60:200,80:255）。
+            # 仍只允许字母数字下划线点减号冒号逗号，杜绝 shell 元字符——防注入且不误伤合法取值。
+            # 键名必须允许**数字**：风扇配置项形如 fan1_mode / fan3_curve。
+            # 曾经只写 [a-z_]+，于是 fan1_mode 一律被判非法、保存永远失败。
+            die "非法参数：$kv\\n" if $kv !~ /^[a-z][a-z0-9_]*=[0-9a-zA-Z_.:,-]+$/;
             push @args, $kv;
         }
         die "没有可写入的配置项\\n" if !@args;
@@ -943,6 +950,19 @@ Ext.define('PVE.node.HwTools', {
                     ],
                 },
                 {
+                    xtype: 'fieldset',
+                    title: gettext('风扇控制'),
+                    itemId: 'fanfs',
+                    defaults: { margin: '4 0' },
+                    items: [
+                        {
+                            xtype: 'component',
+                            itemId: 'fanhint',
+                            html: '',
+                        },
+                    ],
+                },
+                {
                     xtype: 'container',
                     layout: 'hbox',
                     margin: '14 0 0 0',
@@ -972,6 +992,112 @@ Ext.define('PVE.node.HwTools', {
             me.reload();
         });
     },
+
+
+        // 风扇通道控件**必须在这里动态创建**，不能写进 items 数组：
+        // 面板类的 items 在脚本加载期就求值，那时既不知道本机有几个通道、也拿不到配置，
+        // 更要命的是会引入运行期求值 → 整个 pvemanagerlib.js 加载失败（连登录窗都不渲染）。
+        fanVal: function (name) {
+            var c = this.down('[name=' + name + ']');
+            return c ? c.getValue() : null;
+        },
+
+        buildFanRows: function (d) {
+            var me = this;
+            var fs = me.down('#fanfs');
+            if (!fs) { return; }
+            var fans = d.fans || [];
+            var sources = (d.fan_sources || []).map(function (x) {
+                return { v: x.n + ' · ' + x.label, val: String(x.n) };
+            });
+            var hint = me.down('#fanhint');
+            if (hint) {
+                hint.setHtml('<span style="color:#888">' +
+                    (fans.length
+                        ? (gettext('共 ') + fans.length + gettext(' 个通道。自动 = 交给主板硬件按曲线调速（无需常驻程序）；手动 = 固定占空比。'))
+                        : gettext('本机未检测到可控风扇通道。')) + '</span>');
+            }
+            // 每次 reload 都重建：模式与曲线会变，旧控件留着会读到过期值
+            var old = fs.query('[itemId^=fanrow]');
+            (old || []).forEach(function (c) { fs.remove(c, true); });
+
+            fans.forEach(function (f) {
+                var n = f.n;
+                var pts = String(f.curve || '').split(',');
+                var cpts = [];
+                pts.forEach(function (x) {
+                    var kv = String(x).split(':');
+                    if (kv.length === 2) { cpts.push({ t: parseInt(kv[0], 10), w: parseInt(kv[1], 10) }); }
+                });
+                while (cpts.length < 5) { cpts.push({ t: 30 + cpts.length * 10, w: 64 + cpts.length * 48 }); }
+
+                fs.add(Ext.create('Ext.container.Container', {
+                    itemId: 'fanrow' + n,
+                    margin: '2 0',
+                    layout: 'hbox',
+                    defaults: { margin: '0 8 0 0', xtype: 'numberfield', width: 76 },
+                    items: [
+                        { xtype: 'component', width: 100, margin: '6 8 0 0',
+                          html: '<b>' + gettext('通道 ') + n + '</b>' +
+                                '<br/><span style="color:#888">' + (f.rpm || 0) + ' RPM</span>' },
+                        { name: 'fan' + n + '_mode', xtype: 'combo', width: 128,
+                          hideLabel: true, editable: false, forceSelection: true, queryMode: 'local',
+                          displayField: 'v', valueField: 'val',
+                          store: { fields: ['v', 'val'], data: [
+                              { v: gettext('关闭（用主板设置）'), val: 'off' },
+                              { v: gettext('自动曲线'), val: 'auto' },
+                              { v: gettext('手动定值'), val: 'manual' } ] },
+                          value: f.mode || 'off',
+                          listeners: { change: function () { me.fanSyncRow(n); } } },
+                        { name: 'fan' + n + '_manual', width: 84,
+                          emptyText: gettext('占空比'), minValue: 1, maxValue: 255,
+                          value: f.manual || 128, allowBlank: false,
+                          listeners: { change: function () { me.fanSyncRow(n); } } },
+                        { name: 'fan' + n + '_sel', xtype: 'combo', width: 168,
+                          hideLabel: true, editable: false, forceSelection: true,
+                          queryMode: 'local', displayField: 'v', valueField: 'val',
+                          emptyText: gettext('温度源'), store: { fields: ['v', 'val'], data: sources },
+                          value: String(f.sel || '') },
+                    ],
+                }));
+
+                // 曲线第二行：温度 → 占空比，五组
+                var crow = Ext.create('Ext.container.Container', {
+                    itemId: 'fanrow' + n + 'c',
+                    margin: '0 0 6 108',
+                    layout: 'hbox',
+                    items: [{ xtype: 'component', margin: '6 6 0 0',
+                              html: '<span style="color:#888">' + gettext('曲线') + '</span>' }],
+                });
+                cpts.forEach(function (x, i) {
+                    crow.add({ xtype: 'numberfield', name: 'fan' + n + '_pt' + i + '_t',
+                               width: 58, emptyText: gettext('温度'), minValue: 0, maxValue: 120,
+                               value: x.t, hideLabel: true, margin: '0 4 0 0' });
+                    crow.add({ xtype: 'component', margin: '6 4 0 0', html: '℃ →' });
+                    crow.add({ xtype: 'numberfield', name: 'fan' + n + '_pt' + i + '_w',
+                               width: 58, emptyText: gettext('占空比'), minValue: 1, maxValue: 255,
+                               value: x.w, hideLabel: true, margin: '0 12 0 0' });
+                });
+                fs.add(crow);
+                fs.add({ xtype: 'component', itemId: 'fanhint' + n, margin: '0 0 6 108',
+                         html: '<span style="color:#888">' + gettext('五点须按温度由低到高；温度相同或倒序会被拒绝。') + '</span>' });
+
+                me.fanSyncRow(n);
+            });
+        },
+
+        // 按模式启用/禁用该通道的控件——别让人填了不生效的东西
+        fanSyncRow: function (n) {
+            var me = this;
+            var mode = me.down('[name=fan' + n + '_mode]');
+            var v = mode ? mode.getValue() : 'off';
+            var man = me.down('[name=fan' + n + '_manual]');
+            var sel = me.down('[name=fan' + n + '_sel]');
+            var crow = me.down('#fanrow' + n + 'c');
+            if (man) { man.setDisabled(v !== 'manual'); }
+            if (sel) { sel.setDisabled(v !== 'auto'); }
+            if (crow) { crow.query('numberfield').forEach(function (x) { x.setDisabled(v !== 'auto'); }); }
+        },
 
     reload: function () {
         var me = this;
@@ -1012,6 +1138,9 @@ Ext.define('PVE.node.HwTools', {
                     return { v: (mirNames[m] ? mirNames[m] + '（' + m + '）' : m), val: m };
                 }));
                 cbMir.setDisabled(!d.apt_mirror_avail || !mirList.length);
+
+                // 风扇通道与温度源都来自本机实测，控件只能在此动态创建
+                me.buildFanRows(d);
 
                 // 数字框的合法范围也须在 setValues 之前设好，否则被当作越界而清空。
                 // 单位一律 MHz（状态接口已折算好）。
@@ -1055,7 +1184,10 @@ Ext.define('PVE.node.HwTools', {
                     gettext('软件源：') + (d.apt_mirror_avail
                         ? (gettext('当前文件为 ') + (d.apt_mirror_live || '?') +
                            gettext('（配置为 ') + (d.apt_mirror || '?') + gettext('）'))
-                        : gettext('本机未装镜像切换脚本')) +
+                        : gettext('本机未装镜像切换脚本')) + '<br/>' +
+                    gettext('风扇：') + (d.fan_avail
+                        ? (gettext('通道 ') + d.fan_channels + gettext('，本机可控'))
+                        : gettext('本机无可控风扇通道')) +
                     '</span>'
                 );
             },
@@ -1098,7 +1230,53 @@ Ext.define('PVE.node.HwTools', {
         if (cbMir && !cbMir.isDisabled() && val.apt_mirror) {
             kv.push('apt_mirror=' + val.apt_mirror);
         }
-        kv = kv.join(',');
+        // 风扇：只提交本机真实存在的通道。
+        // 注意曲线值**自带逗号**，故各 k=v 之间改用空格分隔（后端同步支持空格切片）。
+        var fanErr = null;
+        me.query('combo').forEach(function (c) {
+            var nm = c.name || '';
+            // 不用正则匹配通道号：注入块是 Python 三引号字符串，里面出现反斜杠
+            // 会被提前转义，历来是这套补丁的翻车点。改用纯字符串切分。
+            if (nm.indexOf('fan') !== 0 || nm.slice(-5) !== '_mode' || fanErr) { return; }
+            var n = nm.slice(3, -5);
+            for (var q = 0; q < n.length; q++) {
+                var ch = n.charCodeAt(q);
+                if (ch < 48 || ch > 57) { return; }
+            }
+            if (!n) { return; }
+            var mode = c.getValue();
+            if (!mode) { return; }
+            kv.push('fan' + n + '_mode=' + mode);
+            if (mode === 'manual') {
+                kv.push('fan' + n + '_manual=' + Math.round(me.fanVal('fan' + n + '_manual')));
+            } else if (mode === 'auto') {
+                var sel = me.fanVal('fan' + n + '_sel');
+                if (sel) { kv.push('fan' + n + '_sel=' + sel); }
+                var pts = [], last = -1;
+                for (var i = 0; i < 5; i++) {
+                    var t = me.fanVal('fan' + n + '_pt' + i + '_t');
+                    var w = me.fanVal('fan' + n + '_pt' + i + '_w');
+                    if (t === null || w === null) {
+                        fanErr = gettext('通道 ') + n + gettext(' 的曲线有空格未填。');
+                        return;
+                    }
+                    t = Math.round(t); w = Math.round(w);
+                    if (t <= last) {
+                        fanErr = gettext('通道 ') + n + gettext(' 的曲线温度必须由低到高（第 ') + (i + 1) + gettext(' 点不大于前一点）。');
+                        return;
+                    }
+                    last = t;
+                    pts.push(t + ':' + w);
+                }
+                kv.push('fan' + n + '_curve=' + pts.join(','));
+            }
+        });
+        if (fanErr) {
+            Ext.Msg.alert(gettext('风扇设置有误'), fanErr);
+            return;
+        }
+        // 空格分隔：曲线值里的逗号得以保留
+        kv = kv.join(' ');
 
         Proxmox.Utils.API2Request({
             url: '/nodes/' + me.nodename + '/hwtools',
@@ -1110,7 +1288,7 @@ Ext.define('PVE.node.HwTools', {
                 PVE.HW.refreshPending = true;
                 Ext.Msg.show({
                     title: gettext('已保存'),
-                    msg: gettext('设置已写入并生效。软件源若已变更则同步切换；概要页会在下一次刷新时按新开关显示。'),
+                    msg: gettext('设置已写入并生效。软件源与风扇同步切换 / 下发给主板；概要页会在下一次刷新时按新开关显示。'),
                     buttons: Ext.Msg.OK,
                     icon: Ext.Msg.INFO,
                 });
