@@ -1,6 +1,6 @@
 # Proxmox VE 面板补丁集
 
-> **当前版本：V2.12** · 发布于 2026-09-25
+> **当前版本：V2.13** · 发布于 2026-09-25
 > 适用：**Proxmox VE 9.x**（在 `pve-manager` 9.2.20 上实测通过）· 需 root
 
 给 PVE 原生 Web 界面补上它不显示的东西：**节点概要的硬件信息**、
@@ -643,11 +643,21 @@ apt 钩子没挂上。检查 `apt-config dump | grep -i post-invoke`，
 3. **改完必须校验语法再重启。**
    `perl -c` 校验 `Nodes.pm`、`node --check` 校验 `pvemanagerlib.js`；失败时自动回滚。
 
-4. **`protected => 1` 是必需的——踩得最深的坑。**
+4. **`protected => 1` 是必需的——踩得最深的坑，读接口也一样。**
    `pveproxy` 以 `www-data` 运行。节点级接口若**不带** `protected => 1`，
    请求就在 pveproxy 进程里**就地降权执行**（`HTTPServer.pm`：只有 `protected` 且 euid≠0
    才转给 root 的 `pvedaemon`），于是特权动作会以非 root 身份失败。原厂所有需 root 的
    节点级接口都带这一项。
+   - **失败是静默的，这是它最难查的地方。** 本补丁的 `hwtools_status`（一个**读**接口）
+     就漏了它：agent 因 `need_root` 直接 die，接口照样返回 **200**、内容是
+     `{"data":{}}`（11 字节、零字段）。前端拿到空对象后，频率显示 `undefined MHz`、
+     风扇说「本机未检测到可控风扇通道」—— 看着像补丁没装，其实全都装好了。
+     **别用「返回 200」判断接口正常，要看正文里有没有真字段。**
+   - **凡是会调 agent（或任何需 root 的命令）的接口，读也要带。** 脚本里已加护栏：
+     注入后逐个断言 `register_method` 块里都有 `protected => 1`，缺一个就拒绝注入。
+   - **连带教训：测「新按钮」测不出这种问题。** 当时验证「使用说明」按钮是通过的 ——
+     因为它读的是 644 的静态文件，不需要 root，恰好绕开了这个坑。**一条链路通了
+     不等于同页面其它接口都通。**
 
 5. **别在 API 处理期间重启 `pvedaemon`。**
    会掐断正在服务该请求的 daemon 自己，表现为 `failed: exit code 1` 或 HTTP 596。
@@ -713,6 +723,37 @@ apt 钩子没挂上。检查 `apt-config dump | grep -i post-invoke`，
 ---
 
 ## 更新日志
+
+### V2.13 · 2026-09-25
+
+**修：设置页一直显示不出数据（从 V2.0 起就坏了）。**
+
+拍设置页截图时发现整页是空的：频率显示 `undefined MHz`、硬件能力 `undefined MHz ~
+undefined MHz`、风扇区说「本机未检测到可控风扇通道」、软件源区也是空的 —— 看着像补丁
+没装上，但配置、agent、进程全都正常。
+
+根因：**`hwtools_status`（状态**读**接口）漏了 `protected => 1`**，其余七个接口都有。
+没有它，请求就在 `pveproxy` 进程里以 `www-data` **降权执行**，而 agent 的 `status`
+要读 sysfs 与传感器、跑着 `need_root` 校验，于是直接 `die`：
+
+```
+$ su -s /bin/bash www-data -c '/usr/local/bin/pve-hwtools-agent status'
+错误：需要 root 权限
+```
+
+接口**照样返回 200**，正文却是 `{"data":{}}`（11 字节、零字段）。前端拿到空对象，
+于是满屏 `undefined`。**失败是静默的**，这是它最难查的地方。
+
+- 给 `hwtools_status` 与 `hwhelp` 都补上 `protected => 1`（后者只读静态文件、
+  本不需要 root，但保持一致，免得日后改动时再踩）。
+- **加护栏**：注入前逐个检查 `register_method` 块，凡缺 `protected => 1` 就
+  **拒绝注入并报出接口名**。这类 bug 从此不可能再溜进产物。
+- 顺带说明「为什么之前没测出来」：验证「使用说明」按钮是**通过**的 —— 它读的是
+  权限 644 的静态文件，恰好不需要 root。**一条链路通了，不代表同一页面的其它接口都通。**
+
+实测（修后）：接口由 `{"data":{}}` 变为 2892 字节 / 42 个字段；设置页显示
+`处理器 Alder Lake (12th Gen Core)、驱动 intel_cpufreq、策略数 8、硬件能力 800~4300 MHz`，
+风扇区 `nct6798 · 通道 1,2,3,4,5,7，本机可控`，页面零 `undefined`。
 
 ### V2.12 · 2026-09-25
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# pve-hwtools-agent —— PVE 工具集状态代理（V2.12）
+# pve-hwtools-agent —— PVE 工具集状态代理（V2.13）
 #
 # 唯一的配置真相：/etc/default/pve-hwtools
 # 职责：读/写该配置；施加 CPU 调频；按配置触发界面重渲染。

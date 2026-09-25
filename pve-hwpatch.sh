@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V2.12
+# 版本：V2.13
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -431,6 +431,12 @@ __PACKAGE__->register_method({
     permissions => { check => ['perm', '/nodes/{node}', ['Sys.Audit']] },
     description => "PVE 工具集状态。",
     proxyto => 'node',
+    # protected => 1 必须有，**读接口也一样**：agent status 要做 sysfs/传感器读取，
+    # 跑着 need_root 校验。不带这项时请求就在 pveproxy 进程里以 www-data 降权执行，
+    # agent 直接 die，于是接口静默返回 {"data":{}}（200，零字段）—— 界面满屏
+    # undefined / 「本机未检测到可控风扇通道」，看着像补丁没装，其实是权限。
+    # 空响应不报错，这是它最难查的地方。
+    protected => 1,
     parameters => {
         additionalProperties => 0,
         properties => { node => get_standard_option('pve-node') },
@@ -652,6 +658,10 @@ __PACKAGE__->register_method({
     permissions => { check => ['perm', '/nodes/{node}', ['Sys.Audit']] },
     description => "面板「使用说明」：返回说明书 HTML（由仓库 README 生成）。",
     proxyto => 'node',
+    # 只读 644 的静态文件、不需要 root，但照样加上 protected => 1：
+    # 保持本文件里所有接口一致，免得以后有人改成读需 root 的东西时踩同一个坑
+    # （少 protected 会被降权成 www-data 执行、且失败是静默的）。
+    protected => 1,
     parameters => {
         additionalProperties => 0,
         properties => { node => get_standard_option('pve-node') },
@@ -673,6 +683,20 @@ __PACKAGE__->register_method({
 # PVE_HWAPI:END
 '''
 s = s.replace(a2, api, 1)
+
+# 2b-1) 护栏：本文件注入的每个接口都必须带 protected => 1。
+#   踩过的坑：hwtools_status（读接口）漏了它，于是请求被 pveproxy 以 www-data
+#   降权执行、agent 因 need_root 直接 die，接口静默返回 {"data":{}} ——
+#   界面满屏 undefined，而一切「看起来」都装好了，极难定位。
+#   凡是本补丁注册的方法都调 agent（需 root），一个都不能漏，这里直接拦住。
+_bad = []
+for _part in api.split("__PACKAGE__->register_method({")[1:]:
+    _m = re.search(r"name => '(\w+)'", _part)
+    if _m and "protected => 1" not in _part.split("});")[0]:
+        _bad.append(_m.group(1))
+if _bad:
+    sys.exit("ERROR: 以下接口缺少 protected => 1，会在 pveproxy 里被降权执行而静默失败：%s"
+             % ", ".join(_bad))
 
 # 内容恰好未变（已是最新）也算成功，不再当作错误——曾因误判为失败而触发回滚，
 # 用备份把补丁整个覆盖掉。
