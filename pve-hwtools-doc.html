@@ -33,7 +33,7 @@
 <div class="pve-hwtools-doc">
 <h1>Proxmox VE 面板补丁集</h1>
 <blockquote>
-<p><strong>当前版本：V2.10</strong> · 发布于 2026-09-25
+<p><strong>当前版本：V2.12</strong> · 发布于 2026-09-25
 适用：<strong>Proxmox VE 9.x</strong>（在 <code>pve-manager</code> 9.2.20 上实测通过）· 需 root</p>
 </blockquote>
 <p>给 PVE 原生 Web 界面补上它不显示的东西：<strong>节点概要的硬件信息</strong>、
@@ -54,7 +54,7 @@
 <tr>
 <td><strong>硬件概要</strong></td>
 <td>节点 → Summary</td>
-<td>CPU 温度（含各核）/ 主板温度 / 风扇转速（带名字）/ 硬盘型号容量温度 / CPU 频率与代号。四项可分别开关</td>
+<td>CPU 温度（封装）/ 核心温度平均值 / 主板温度 / 风扇转速（带名字）/ 硬盘型号容量温度 / CPU 频率与代号。四项可分别开关</td>
 </tr>
 <tr>
 <td><strong>CPU 调频</strong></td>
@@ -189,8 +189,7 @@ pvesh get /nodes/&lt;节点名&gt;/hwtools --output-format json
 <h3>2.1 节点概要的「硬件概要」</h3>
 <p>节点 → <strong>Summary</strong>，右侧出现一整块：</p>
 <ul>
-<li><strong>CPU 温度</strong>（封装）、<strong>主板温度</strong></li>
-<li><strong>CPU 各核</strong> —— 带核名：<code>Core 0 43.0 °C | Core 1 42.0 °C | …</code></li>
+<li><strong>CPU 温度</strong>（封装）、<strong>核心温度平均值</strong>（带核数：<code>44.0 °C（4 核平均）</code>）、<strong>主板温度</strong></li>
 <li><strong>风扇转速</strong> —— 带名字：<code>CPU 风扇 1053 RPM | 机箱风扇 1331 RPM</code></li>
 <li><strong>硬盘温度</strong> —— 型号 + 容量 + 温度：<code>Lexar SSD NM620 512GB 39 °C</code>
   （NVMe 走 hwmon，SATA 走 <code>smartctl</code>）</li>
@@ -235,7 +234,7 @@ pvesh get /nodes/&lt;节点名&gt;/hwtools --output-format json
 会<strong>当场从 README 重新生成</strong>，连重新提交都不必。</p>
 </blockquote>
 <h4>概要显示</h4>
-<p>四个勾选框：CPU 温度（含各核）/ 风扇转速 / 硬盘概要 / CPU 频率。</p>
+<p>四个勾选框：CPU 温度（封装与核心平均）/ 风扇转速 / 硬盘概要 / CPU 频率。</p>
 <h4>CPU 调频</h4>
 <ul>
 <li><strong>调频模式</strong> —— <code>performance</code> / <code>powersave</code> / <code>ondemand</code> / <code>conservative</code> / <code>schedutil</code></li>

@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V2.10
+# 版本：V2.12
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -268,10 +268,10 @@ else
 fi
 
 # ---------- 1) 传感器取样脚本（纯 ASCII 数值与名称）----------
-if [ ! -f "$SH" ] || ! grep -q "$MARK-v10" "$SH" 2>/dev/null; then
+if [ ! -f "$SH" ] || ! grep -q "$MARK-v12" "$SH" 2>/dev/null; then
   cat > "$SH" <<'EOS'
 #!/bin/bash
-# PVE_HWPATCH-v10 —— 输出节点硬件概要 JSON（单行，纯 ASCII 数值与名称，单位由前端补）
+# PVE_HWPATCH-v12 —— 输出节点硬件概要 JSON（单行，纯 ASCII 数值与名称，单位由前端补）
 je(){ printf '%s' "$1" | LC_ALL=C sed 's/\\/\\\\/g; s/"/\\"/g; s/[^ -~]//g'; }
 command -v sensors >/dev/null 2>&1 || { echo '{}'; exit 0; }
 S=$(sensors 2>/dev/null)
@@ -279,8 +279,12 @@ S=$(sensors 2>/dev/null)
 CPU_PKG=$(printf '%s\n' "$S" | awk '/Package id 0/{print $4; exit}' | tr -d '+C')
 [ -z "$CPU_PKG" ] && CPU_PKG=$(cat /sys/class/hwmon/hwmon*/temp1_input 2>/dev/null | head -1 | awk '{printf "%.1f", $1/1000}')
 
-# 各核：带核名（Core 0:44.0,Core 1:43.0,...  逗号分隔，因核名内含空格）
-CORES=$(printf '%s\n' "$S" | awk '/^Core [0-9]+:/{n=$1" "$2; sub(/:$/,"",n); v=$3; gsub(/[+C]/,"",v); printf "%s:%s,", n, v}' | sed 's/,$//')
+# 核心温度：只输出**平均值 + 核数**，不再逐核列出。
+#   逐核列会随核心数增长（64 核的机器能把概要行撑成好几行），且核名格式
+#   各驱动不一（coretemp 是 "Core N:"，部分平台是 "CPU N:"）。取平均后
+#   一行固定长度，界面再补上核数即可。
+CORE_N=$(printf '%s\n' "$S" | awk '/^Core [0-9]+:|^CPU [0-9]+:/{c++} END{print c+0}')
+CORE_AVG=$(printf '%s\n' "$S" | awk '/^Core [0-9]+:|^CPU [0-9]+:/{v=$3; gsub(/[^0-9.-]/,"",v); if(v ~ /^-?[0-9]+(\.[0-9]+)?$/){s+=v; n++}} END{if(n>0) printf "%.1f", s/n; else printf "-"}')
 
 BOARD=$(printf '%s\n' "$S" | awk '/CPUTIN/{print $2; exit}' | tr -d '+C')
 [ -z "$BOARD" ] && BOARD=$(printf '%s\n' "$S" | awk '/SYSTIN/{print $2; exit}' | tr -d '+C')
@@ -371,13 +375,13 @@ CPUGEN="-"; BASEF=0
 b=$(cat /sys/devices/system/cpu/cpu0/cpufreq/base_frequency 2>/dev/null)
 [ -n "$b" ] && BASEF=$(awk "BEGIN{printf \"%d\", $b/1000}")
 
-printf '{"cpu_pkg":"%s","cpu_cores":"%s","disks":"%s","board":"%s","fans":"%s","cpu_cur":"%s","cpu_min":"%s","cpu_max":"%s","cpu_gen":"%s","cpu_base":"%s"}\n' \
-  "$(je "${CPU_PKG:--}")" "$(je "${CORES:--}")" "$(je "$DISKS")" "$(je "${BOARD:--}")" \
+printf '{"cpu_pkg":"%s","cpu_core_avg":"%s","cpu_core_n":"%s","disks":"%s","board":"%s","fans":"%s","cpu_cur":"%s","cpu_min":"%s","cpu_max":"%s","cpu_gen":"%s","cpu_base":"%s"}\n' \
+  "$(je "${CPU_PKG:--}")" "$(je "${CORE_AVG:--}")" "${CORE_N:-0}" "$(je "$DISKS")" "$(je "${BOARD:--}")" \
   "$(je "${FANS:--}")" "${CUR:-0}" "${MIN:-0}" "${MAX:-0}" "$(je "$CPUGEN")" "${BASEF:-0}"
 EOS
-  chmod +x "$SH"; changed=1; echo "  [1] 已写 $SH（v10）"
+  chmod +x "$SH"; changed=1; echo "  [1] 已写 $SH（v12）"
 else
-  echo "  [1] $SH 已是 v10，跳过"
+  echo "  [1] $SH 已是 v12，跳过"
 fi
 
 # ---------- 2) 后端：概要取值（tdata）+ 工具集 API（hwtools）----------
@@ -774,14 +778,16 @@ items = """            textField: 'pveversion',
             itemId: 'hw-cpucores',
             colspan: 2,
             printBar: false,
-            title: gettext('CPU各核'),
+            title: gettext('CPU核心温度'),
             textField: 'tdata',
             renderer: function (v) {
                 try {
-                    return JSON.parse(v).cpu_cores.split(',').map(function (x) {
-                        var q = x.split(':');
-                        return q[0] + ' ' + q[1] + ' °C';
-                    }).join(' | ');
+                    var d = JSON.parse(v);
+                    var avg = d.cpu_core_avg;
+                    if (!avg || avg === '-') { return '-'; }
+                    var n = parseInt(d.cpu_core_n, 10) || 0;
+                    // 只显示平均值，括号里注明核数（核多的机器逐核列会撑成好几行）
+                    return avg + ' °C' + (n > 0 ? '（' + n + ' 核平均）' : '');
                 } catch (e) { return '-'; }
             },
         },
@@ -1016,27 +1022,52 @@ PVE.node.StatusView.prototype.updateValues = function (store, records, success) 
 PVE.HW.attach = function (panel, nodename) {
     panel._hwNode = nodename;
     panel._hwHidden = [];
-    try {
+    // 取显示开关。**取不到就当作全开**（绝不隐藏任何东西）——
+    // 这里的失败模式很坑：状态接口一旦瞬时报错（如会话未就绪时返回 {"data":null}），
+    // 下面的 `|| {}` 会让四个开关全判 false，于是整块硬件概要被 display:none 藏掉，
+    // 用户看到的是「补丁没生效」，而配置、接口、数据其实全都正常。
+    // 宁可多显示，不可误隐藏。
+    var readSwitches = function () {
         var rq = Ext.Ajax.request({ url: '/api2/json/nodes/' + nodename + '/hwtools', async: false });
-        var d = Ext.decode(rq.responseText).data || {};
-        var one = function (v) { return String(v) === '1'; };
-        var ids = [];
-        if (!one(d.show_cpu_temp)) { ids.push('hw-cputemp', 'hw-board', 'hw-cpucores'); }
-        if (!one(d.show_fan)) { ids.push('hw-fans'); }
-        if (!one(d.show_disk)) { ids.push('hw-disktemp'); }
-        if (!one(d.show_cpu_freq)) { ids.push('hw-cpufreq'); }
-        if (ids.length >= 4) { ids.push('hw-header'); }  // 全关则连表头一并收起
-        panel._hwHidden = ids;
-    } catch (e) {
-        panel._hwHidden = [];
-    }
-    var run = function () {
-        PVE.HW.hide(panel);
+        var j = Ext.decode(rq.responseText, true);
+        // Ext.decode 带 useNull 参数：解析失败返回 null，不会抛
+        if (!j || !j.data) { return null; }
+        var d = j.data;
+        // 四个开关一个都没有 => 认为这不是有效的状态响应
+        if (d.show_cpu_temp === undefined && d.show_fan === undefined
+            && d.show_disk === undefined && d.show_cpu_freq === undefined) { return null; }
+        var on = function (v) { return String(v) === '1'; };
+        return { cpu_temp: on(d.show_cpu_temp), fan: on(d.show_fan),
+                 disk: on(d.show_disk), cpu_freq: on(d.show_cpu_freq) };
     };
+    var apply = function (sw) {
+        if (!sw) { panel._hwHidden = []; return; }   // 读不到 => 什么都不藏
+        var ids = [];
+        if (!sw.cpu_temp) { ids.push('hw-cputemp', 'hw-board', 'hw-cpucores'); }
+        if (!sw.fan) { ids.push('hw-fans'); }
+        if (!sw.disk) { ids.push('hw-disktemp'); }
+        if (!sw.cpu_freq) { ids.push('hw-cpufreq'); }
+        // 四项全关才收表头。注意不能用 ids.length >= 4 判断：
+        // 「CPU 温度 + 风扇」两项关掉也会凑满 4 个 id，那样会把表头一起误藏。
+        if (!sw.cpu_temp && !sw.fan && !sw.disk && !sw.cpu_freq) { ids.push('hw-header'); }
+        panel._hwHidden = ids;
+    };
+    var sw = null;
+    try { sw = readSwitches(); } catch (e) { sw = null; }
+    apply(sw);
+    var run = function () { PVE.HW.hide(panel); };
     if (panel.rendered) {
         run();
     } else {
         panel.on('afterrender', run);
+    }
+    // 首读失败（常见于会话还没就绪）则稍后重试一次，拿到真值后再应用
+    if (!sw) {
+        Ext.defer(function () {
+            var s2 = null;
+            try { s2 = readSwitches(); } catch (e) { s2 = null; }
+            if (s2) { apply(s2); PVE.HW.hide(panel); }
+        }, 1500);
     }
 };
 
@@ -1074,7 +1105,7 @@ Ext.define('PVE.node.HwTools', {
                     title: gettext('概要显示'),
                     defaults: { margin: '4 0' },
                     items: [
-                        mkCb('显示 CPU 温度（含各核）', 'show_cpu_temp'),
+                        mkCb('显示 CPU 温度（封装与核心平均）', 'show_cpu_temp'),
                         mkCb('显示风扇转速', 'show_fan'),
                         mkCb('显示硬盘概要（型号 / 容量 / 温度）', 'show_disk'),
                         mkCb('显示 CPU 频率', 'show_cpu_freq'),
