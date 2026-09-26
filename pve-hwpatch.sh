@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V3.0
+# 版本：V3.1
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -970,7 +970,7 @@ items = """            textField: 'pveversion',
         },
         {
             itemId: 'hw-cpucores',
-            colspan: 2,
+            colspan: 1,
             printBar: false,
             title: gettext('CPU核心温度'),
             textField: 'tdata',
@@ -987,7 +987,7 @@ items = """            textField: 'pveversion',
         },
         {
             itemId: 'hw-fans',
-            colspan: 2,
+            colspan: 1,
             printBar: false,
             title: gettext('风扇转速'),
             textField: 'tdata',
@@ -1012,8 +1012,32 @@ items = """            textField: 'pveversion',
             },
         },
         {
+            itemId: 'hw-cpufreq',
+            colspan: 1,
+            printBar: false,
+            title: gettext('CPU频率'),
+            textField: 'tdata',
+            renderer: function (v) {
+                try {
+                    var d = JSON.parse(v);
+                    var cur = d.cpu_cur && d.cpu_cur !== '0' ? d.cpu_cur + ' MHz' : '-';
+                    var rng = (d.cpu_min && d.cpu_min !== '0' ? d.cpu_min : '-') + ' ~ ' +
+                              (d.cpu_max && d.cpu_max !== '0' ? d.cpu_max + ' MHz' : '-');
+                    var out = cur + '  (' + rng + ')';
+                    // 换行用 HTML 标签：单元格内容按 HTML 渲染，纯换行字符会被折叠成空格。
+                    // （也避免了在 Python 三引号块里写反斜杠转义。）
+                    // 代号与基准频率（CPUID 映射；AMD 机器同样适用）
+                    if (d.cpu_gen && d.cpu_gen !== '-') {
+                        out += '<br/>' + d.cpu_gen +
+                               ((d.cpu_base && d.cpu_base !== '0') ? (' · 基准 ' + d.cpu_base + ' MHz') : '');
+                    }
+                    return out;
+                } catch (e) { return '-'; }
+            },
+        },
+        {
             itemId: 'hw-disktemp',
-            colspan: 2,
+            colspan: 1,
             printBar: false,
             title: gettext('硬盘温度'),
             textField: 'tdata',
@@ -1025,31 +1049,7 @@ items = """            textField: 'pveversion',
                         var q = r.split('|');
                         var t = (parseInt(q[1], 10) / 1000).toFixed(0);
                         return q[0] + '  ' + t + ' °C  ' + q[2];
-                    }).join('      |      ');
-                } catch (e) { return '-'; }
-            },
-        },
-        {
-            itemId: 'hw-cpufreq',
-            colspan: 2,
-            printBar: false,
-            title: gettext('CPU频率'),
-            textField: 'tdata',
-            renderer: function (v) {
-                try {
-                    var d = JSON.parse(v);
-                    var cur = d.cpu_cur && d.cpu_cur !== '0' ? d.cpu_cur + ' MHz' : '-';
-                    var rng = (d.cpu_min && d.cpu_min !== '0' ? d.cpu_min : '-') + ' ~ ' +
-                              (d.cpu_max && d.cpu_max !== '0' ? d.cpu_max + ' MHz' : '-');
-                    var out = cur + '  (min~max: ' + rng + ')';
-                    // 换行用 HTML 标签：单元格内容按 HTML 渲染，纯换行字符会被折叠成空格。
-                    // （也避免了在 Python 三引号块里写反斜杠转义。）
-                    // 代号与基准频率（CPUID 映射；AMD 机器同样适用）
-                    if (d.cpu_gen && d.cpu_gen !== '-') {
-                        out += '<br/>' + d.cpu_gen +
-                               ((d.cpu_base && d.cpu_base !== '0') ? (' · 基准 ' + d.cpu_base + ' MHz') : '');
-                    }
-                    return out;
+                    }).join('<br/>');
                 } catch (e) { return '-'; }
             },
         },
