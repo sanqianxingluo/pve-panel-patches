@@ -33,7 +33,7 @@
 <div class="pve-hwtools-doc">
 <h1>Proxmox VE 面板补丁集</h1>
 <blockquote>
-<p><strong>当前版本：V3.2</strong> · 发布于 2026-09-26
+<p><strong>当前版本：V3.3</strong> · 发布于 2026-09-26
 适用：<strong>Proxmox VE 9.x</strong>（在 <code>pve-manager</code> 9.2.20 上实测通过）· 需 root</p>
 </blockquote>
 <p>给 PVE 原生 Web 界面补上它不显示的东西：<strong>节点概要的硬件信息</strong>、
@@ -196,8 +196,10 @@ pvesh get /nodes/&lt;节点名&gt;/hwtools --output-format json
 <ul>
 <li><strong>CPU 温度</strong>（封装）、<strong>核心温度平均值</strong>（带核数：<code>44.0 °C（4 核平均）</code>）、<strong>主板温度</strong></li>
 <li><strong>风扇转速</strong> —— 带名字：<code>CPU 风扇 1053 RPM | 机箱风扇 1331 RPM</code></li>
-<li><strong>硬盘温度</strong> —— 型号 + 容量 + 温度：<code>Lexar SSD NM620 512GB 39 °C</code>
-  （NVMe 走 hwmon，SATA 走 <code>smartctl</code>）</li>
+<li><strong>硬盘概要</strong> —— 型号 + 温度 + 健康 + 寿命 + 累计读写：
+  <code>Lexar SSD NM620 512GB 39 °C 正常 寿命 95% 读 13.7 TB 写 19.0 TB</code>
+  （温度 NVMe 走 hwmon、SATA 走 <code>smartctl</code>；健康/寿命/读写由 root 定时采集到缓存，
+  面板只读缓存 —— 因为接口以 <code>www-data</code> 执行，而 <code>smartctl</code> 读 <code>/dev/*</code> 需要 root）</li>
 <li><strong>CPU 频率</strong> —— 实时 / 最小 / 最大（MHz）；下方第二行显示 <strong>CPU 代号与基准频率</strong>，
   如 <code>Alder Lake (12th Gen Core) · 基准 3300 MHz</code></li>
 </ul>

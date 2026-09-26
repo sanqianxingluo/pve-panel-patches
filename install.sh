@@ -110,6 +110,8 @@ if [ "$MODE" = uninstall ]; then
   say "[2] 停用并移除开机应用单元"
   systemctl disable --now "$SVC" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/$SVC"
+  systemctl disable --now pve-hwtools-smart.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/pve-hwtools-smart.timer /etc/systemd/system/pve-hwtools-smart.service
   systemctl daemon-reload >/dev/null 2>&1 || true
 
   say "[3] 还原被改的 PVE 原厂文件"
@@ -164,10 +166,11 @@ PY
 
   say "[5] 删除补丁文件"
   rm -f "$DEST/pve-hwpatch.sh" "$DEST/pve-hwtools-agent" "$DEST/pve-nosub-patch.sh" "$DEST/pve-mirror-switch.sh"
+  rm -f /usr/local/bin/pve-hwtools-smart /run/pve-hwtools-smart.txt
   rm -f /usr/bin/s.sh
   rm -rf "$HWDEST"
   find /usr/share/pve-manager /usr/share/perl5 -name '*.orig.hwpatch' -delete 2>/dev/null || true
-  say "    已删四个补丁脚本 + /usr/bin/s.sh + $HWDEST（含使用说明 doc.html）"
+  say "    已删四个补丁脚本 + SMART 采集器 + /usr/bin/s.sh + $HWDEST（含使用说明 doc.html）"
 
   say "[6] 重启服务"
   systemctl restart pvedaemon pveproxy 2>/dev/null || true
@@ -305,6 +308,8 @@ chk "状态代理就位"        "[ -x $DEST/pve-hwtools-agent ]"
 chk "订阅屏蔽脚本就位"    "[ -x $DEST/pve-nosub-patch.sh ]"
 chk "镜像切换脚本就位"    "[ -x $DEST/pve-mirror-switch.sh ]"
 chk "取样脚本 /usr/bin/s.sh 就位" "[ -f /usr/bin/s.sh ]"
+chk "SMART 采集器就位"    "[ -x /usr/local/bin/pve-hwtools-smart ]"
+chk "SMART 采集定时器已启用" "systemctl is-enabled --quiet pve-hwtools-smart.timer"
 chk "CPU 世代映射就位"    "[ -f $HWDEST/cpu-model.sh ]"
 chk "配置 /etc/default/pve-hwtools 就位" "[ -f /etc/default/pve-hwtools ]"
 chk "后端已注入 Nodes.pm" "grep -q PVE_HWAPI /usr/share/perl5/PVE/API2/Nodes.pm"

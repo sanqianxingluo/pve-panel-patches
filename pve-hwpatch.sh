@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V3.2
+# 版本：V3.3
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -33,6 +33,7 @@ AGENT=/usr/local/bin/pve-hwtools-agent
 J=/usr/share/pve-manager/js/pvemanagerlib.js
 N=/usr/share/perl5/PVE/API2/Nodes.pm
 SH=/usr/bin/s.sh
+SMARTBIN=/usr/local/bin/pve-hwtools-smart
 CPUDBDIR=/usr/local/lib/pve-hwtools
 CPUDB="$CPUDBDIR/cpu-model.sh"
 MIRROR=/usr/local/bin/pve-mirror-switch.sh
@@ -268,10 +269,10 @@ else
 fi
 
 # ---------- 1) 传感器取样脚本（纯 ASCII 数值与名称）----------
-if [ ! -f "$SH" ] || ! grep -q "$MARK-v12" "$SH" 2>/dev/null; then
+if [ ! -f "$SH" ] || ! grep -q "$MARK-v14" "$SH" 2>/dev/null; then
   cat > "$SH" <<'EOS'
 #!/bin/bash
-# PVE_HWPATCH-v12 —— 输出节点硬件概要 JSON（单行，纯 ASCII 数值与名称，单位由前端补）
+# PVE_HWPATCH-v14 —— 输出节点硬件概要 JSON（单行，纯 ASCII 数值与名称，单位由前端补）
 je(){ printf '%s' "$1" | LC_ALL=C sed 's/\\/\\\\/g; s/"/\\"/g; s/[^ -~]//g'; }
 command -v sensors >/dev/null 2>&1 || { echo '{}'; exit 0; }
 S=$(sensors 2>/dev/null)
@@ -326,34 +327,62 @@ fi
 FANS=${FANS%|}
 [ -z "$FANS" ] && FANS="-"
 
-# 磁盘：型号|温度(毫度)|容量
+# 磁盘概要：型号|温度(毫度)|容量|健康码|剩余寿命%|累计读|累计写
+#   健康码 0=正常 1=警告 2=异常（空=未知）；剩余寿命与读写读不到就留空。
+#   脚本只吐 ASCII，单位与文字（°C / 健康）由前端补。
+#
+#   健康/寿命/读写**不在这里调 smartctl**：本脚本常以 www-data 身份被调用
+#   （pveproxy 服务 /nodes/<node>/status 时降权），而 smartctl 打开 /dev/* 需要
+#   root —— 非 root 直接 "Permission denied"，这些字段就永远是空的（实测踩过）。
+#   改由 root 定时跑 /usr/local/bin/pve-hwtools-smart 把结果写进世界可读的缓存，
+#   此处只读缓存；缓存缺了/过期就留空，绝不因此报错。
 DISKS=""
-add_disk(){
-  local dev="$1" tm="$2" model cap sz
-  [ -e /sys/block/$dev ] || return
-  model=$(cat /sys/block/$dev/device/model 2>/dev/null | tr -d '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/  */ /g')
-  [ -z "$model" ] && model="$dev"
-  sz=$(cat /sys/block/$dev/size 2>/dev/null)
-  if [ -n "$sz" ] && [ "$sz" -gt 0 ] 2>/dev/null; then
-    cap=$(awk "BEGIN{printf \"%.0fG\", $sz*512/1000/1000/1000}")
-  else cap="?"; fi
-  DISKS="${DISKS}${model}|${tm}|${cap};"
+DISK_SEEN=""
+SMART_CACHE=/run/pve-hwtools-smart.txt
+
+# 从缓存里取某设备的 SMART 字段：dev|health|life|rd|wr|temp
+smart_cached(){
+  local dev="$1" f="$2"
+  [ -r "$SMART_CACHE" ] || return
+  awk -F'|' -v d="/dev/$dev" -v n="$f" '$1==d {print $n; exit}' "$SMART_CACHE"
 }
+
+add_disk(){
+  local dev="$1" tm="$2" model cap sz health life rd wr
+  [ -n "$dev" ] || return
+  [ -e "/sys/block/$dev" ] || return
+  case ";$DISK_SEEN;" in *";$dev;"*) return;; esac
+  DISK_SEEN="${DISK_SEEN}${dev};"
+  # 型号里禁掉字段分隔符，免得把一行拆碎
+  model=$(cat "/sys/block/$dev/device/model" 2>/dev/null | tr -d '\n|;' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/  */ /g')
+  [ -z "$model" ] && model="$dev"
+  sz=$(cat "/sys/block/$dev/size" 2>/dev/null)
+  if [ -n "$sz" ] && [ "$sz" -gt 0 ] 2>/dev/null; then
+    cap=$(awk -v s="$sz" 'BEGIN{printf "%.0fG", s*512/1000/1000/1000}')
+  else cap="?"; fi
+  health=$(smart_cached "$dev" 2)
+  life=$(smart_cached "$dev" 3)
+  rd=$(smart_cached "$dev" 4)
+  wr=$(smart_cached "$dev" 5)
+  # 温度优先用 hwmon 的瞬时值；没有则用缓存里的（smart 采到的）
+  if [ -z "$tm" ]; then tm=$(smart_cached "$dev" 6); fi
+  DISKS="${DISKS}${model}|${tm}|${cap}|${health}|${life}|${rd}|${wr};"
+}
+# ① NVMe：温度走 hwmon（瞬时、无需 smart），型号与容量走 /sys/block
 for h in /sys/class/hwmon/hwmon*; do
   [ "$(cat $h/name 2>/dev/null)" = "nvme" ] || continue
   t=$(cat $h/temp1_input 2>/dev/null)
-  [ -n "$t" ] || continue
   ctrl=$(basename "$(readlink -f $h/device 2>/dev/null)" 2>/dev/null)
   dev=""
   [ -n "$ctrl" ] && dev=$(ls /sys/block 2>/dev/null | grep -m1 "^${ctrl}n")
   [ -z "$dev" ] && dev="$ctrl"
   add_disk "$dev" "$t"
 done
+# ② SATA / SAS：温度由 smartctl 回退填
 if command -v smartctl >/dev/null 2>&1; then
   for d in /dev/sd[a-z]; do
     [ -e "$d" ] || continue
-    t=$(smartctl -A "$d" 2>/dev/null | awk '/Temperature_Celsius|Airflow_Temperature_Cel/{print $10; exit}')
-    [ -n "$t" ] && add_disk "$(basename $d)" "$((t*1000))"
+    add_disk "$(basename $d)" ""
   done
 fi
 DISKS=$(printf '%s' "$DISKS" | sed 's/;$//'); [ -z "$DISKS" ] && DISKS="-"
@@ -379,9 +408,114 @@ printf '{"cpu_pkg":"%s","cpu_core_avg":"%s","cpu_core_n":"%s","disks":"%s","boar
   "$(je "${CPU_PKG:--}")" "$(je "${CORE_AVG:--}")" "${CORE_N:-0}" "$(je "$DISKS")" "$(je "${BOARD:--}")" \
   "$(je "${FANS:--}")" "${CUR:-0}" "${MIN:-0}" "${MAX:-0}" "$(je "$CPUGEN")" "${BASEF:-0}"
 EOS
-  chmod +x "$SH"; changed=1; echo "  [1] 已写 $SH（v12）"
+  chmod +x "$SH"; changed=1; echo "  [1] 已写 $SH（v14）"
 else
-  echo "  [1] $SH 已是 v12，跳过"
+  echo "  [1] $SH 已是 v14，跳过"
+fi
+
+# ---------- 1b) SMART 采集器 ----------
+# 为什么单独一个 root 采集器：/nodes/<node>/status 由 pveproxy 以 www-data 执行，
+# 而 smartctl 读 /dev/* 需要 root（非 root 直接 Permission denied）。于是健康度/
+# 寿命/读写量在面板里永远是空的。办法：root 定时采一次 → 写世界可读的缓存，
+# s.sh（可能非 root）只读缓存。
+if [ ! -f "$SMARTBIN" ] || ! grep -q "PVE_HWPATCH-SMART-v1" "$SMARTBIN" 2>/dev/null; then
+  cat > "$SMARTBIN" <<'EOSM'
+#!/bin/bash
+# PVE_HWPATCH-SMART-v1 —— root 采集各磁盘 SMART 到世界可读缓存。
+#   输出 <dev>|健康|剩余寿命%|累计读|累计写|温度(毫度)，每行一块盘；读不到留空。
+#   健康 0=正常 1=警告 2=异常
+OUT=/run/pve-hwtools-smart.txt
+TMP="${OUT}.$$"
+: > "$TMP" || exit 1
+
+if command -v smartctl >/dev/null 2>&1; then
+  for b in /sys/block/*; do
+    n=$(basename "$b")
+    case "$n" in sd*|hd*|vd*|nvme*|mmcblk*) : ;; *) continue;; esac
+    [ -e "/dev/$n" ] || continue
+    sr=$(smartctl -H -A "/dev/$n" 2>/dev/null)
+    [ -n "$sr" ] || continue
+
+    health=""
+    h=$(printf '%s\n' "$sr" | sed -n 's/.*self-assessment test result:[[:space:]]*\([A-Za-z_]*\).*/\1/p' | head -1)
+    case "$h" in
+      PASSED|OK) health=0;;
+      FAILED|FAILURE) health=2;;
+      *)
+        cw=$(printf '%s\n' "$sr" | awk '/Critical Warning/{print $3; exit}')
+        case "$cw" in ""|0x00) : ;; *) health=1;; esac
+        ;;
+    esac
+
+    life=""
+    pu=$(printf '%s\n' "$sr" | awk -F: '/Percentage Used/{gsub(/[^0-9]/,"",$2); print $2; exit}')
+    if [ -n "$pu" ]; then
+      life=$((100-pu))
+    else
+      wl=$(printf '%s\n' "$sr" | awk -F'[ ]+' '/Wear_Leveling_Count/{print $10; exit}')
+      [ -z "$wl" ] && wl=$(printf '%s\n' "$sr" | awk -F'[ ]+' '/Media_Wearout_Indicator/{print $10; exit}')
+      case "$wl" in ''|*[!0-9]*) : ;; *) [ "$wl" -le 100 ] && life="$wl";; esac
+    fi
+
+    rd=$(printf '%s\n' "$sr" | awk -F'[][]' 'index($0,"Data Units Read")>0 {print $2; exit}')
+    wr=$(printf '%s\n' "$sr" | awk -F'[][]' 'index($0,"Data Units Written")>0 {print $2; exit}')
+    if [ -z "$rd" ]; then
+      lba=$(printf '%s\n' "$sr" | awk -F'[ ]+' 'index($0,"Total_LBAs_Read")>0 {print $10; exit}')
+      case "$lba" in ''|*[!0-9]*) : ;; *) rd=$(awk -v b="$lba" 'BEGIN{n=b*512; if(n>=1099511627776) printf "%.1f TB", n/1099511627776; else printf "%.1f GB", n/1073741824}');; esac
+    fi
+    if [ -z "$wr" ]; then
+      lba=$(printf '%s\n' "$sr" | awk -F'[ ]+' 'index($0,"Total_LBAs_Written")>0 {print $10; exit}')
+      case "$lba" in ''|*[!0-9]*) : ;; *) wr=$(awk -v b="$lba" 'BEGIN{n=b*512; if(n>=1099511627776) printf "%.1f TB", n/1099511627776; else printf "%.1f GB", n/1073741824}');; esac
+    fi
+
+    tm=""
+    t=$(printf '%s\n' "$sr" | awk -F: '/^Temperature:/{gsub(/[^0-9]/,"",$2); print $2; exit}')
+    [ -z "$t" ] && t=$(printf '%s\n' "$sr" | awk '/Temperature_Celsius|Airflow_Temperature_Cel/{print $10; exit}')
+    case "$t" in ''|*[!0-9]*) : ;; *) tm=$((t*1000));; esac
+
+    printf '/dev/%s|%s|%s|%s|%s|%s\n' "$n" "$health" "$life" "$rd" "$wr" "$tm" >> "$TMP"
+  done
+fi
+
+chmod 644 "$TMP" 2>/dev/null
+mv -f "$TMP" "$OUT" 2>/dev/null || { rm -f "$TMP"; exit 1; }
+exit 0
+EOSM
+  chmod +x "$SMARTBIN"; changed=1; echo "  [1b] 已写 $SMARTBIN（SMART 采集器）"
+else
+  echo "  [1b] $SMARTBIN 已存在（SMART 采集器）"
+fi
+# SMART 缓存必须**开机就有**（/run 是内存盘，重启即空），否则重启后头几分钟
+# 面板上健康/寿命/读写是空的。所以：① 立刻采一次；② 挂一个开机 oneshot + 定时器。
+"$SMARTBIN" >/dev/null 2>&1 || true
+if [ ! -f /etc/systemd/system/pve-hwtools-smart.service ]; then
+  cat > /etc/systemd/system/pve-hwtools-smart.service <<'EOUS'
+[Unit]
+Description=Collect disk SMART data for PVE hwtools summary (root-only, cached for www-data)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pve-hwtools-smart
+EOUS
+  changed=1; echo "  [1b] 已建 pve-hwtools-smart.service"
+fi
+if [ ! -f /etc/systemd/system/pve-hwtools-smart.timer ]; then
+  cat > /etc/systemd/system/pve-hwtools-smart.timer <<'EOUT'
+[Unit]
+Description=Periodically refresh disk SMART cache (read/write totals change over time)
+
+[Timer]
+OnBootSec=40s
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOUT
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable --now pve-hwtools-smart.timer >/dev/null 2>&1
+  changed=1; echo "  [1b] 已建并启用 pve-hwtools-smart.timer（每 5 分钟刷新）"
 fi
 
 # ---------- 2) 后端：概要取值（tdata）+ 工具集 API（hwtools）----------
@@ -1039,16 +1173,53 @@ items = """            textField: 'pveversion',
             itemId: 'hw-disktemp',
             colspan: 2,
             printBar: false,
-            title: gettext('硬盘温度'),
+            title: gettext('硬盘概要'),
             textField: 'tdata',
             renderer: function (v) {
                 try {
                     var d = JSON.parse(v).disks;
                     if (d === '-') { return '-'; }
+                    // 每块盘一行：型号  容量  温度  健康  寿命  读写
+                    // 字段：型号|温度(毫度)|容量|健康码|剩余寿命%|累计读|累计写
+                    // 后端读不到的字段一律留空，此处整段跳过，不显示「-」占位。
+                    // 健康/寿命按状态着色（正常绿、警告橙、异常红），值本身用默认色。
                     return d.split(';').map(function (r) {
                         var q = r.split('|');
-                        var t = (parseInt(q[1], 10) / 1000).toFixed(0);
-                        return q[0] + '  ' + t + ' °C  ' + q[2];
+                        var model = q[0] || '';
+                        var tm = parseInt(q[1], 10);
+                        var cap = q[2] || '';
+                        var health = q[3] || '';
+                        var life = q[4] || '';
+                        var rd = q[5] || '';
+                        var wr = q[6] || '';
+                        var parts = [model];
+                        // 容量：型号里常常已经含了（如 "Lexar SSD NM620 512GB" 含 512），
+                        // 再单列一次就是重复，还容易把这一行挤到换行。型号里已含该数字就跳过。
+                        if (cap && cap !== '?') {
+                            var capNum = (cap.match(/[0-9]+/) || [''])[0];
+                            if (!capNum || model.indexOf(capNum) < 0) { parts.push(cap); }
+                        }
+                        if (tm > 0) { parts.push(Math.round(tm / 1000) + ' °C'); }
+                        var color = '';
+                        if (health !== '') {
+                            var hc = { '0': [gettext('正常'), '#1a7f37'],
+                                       '1': [gettext('警告'), '#b26a00'],
+                                       '2': [gettext('异常'), '#c00000'] }[health];
+                            if (hc) { parts.push('<span style="color:' + hc[1] + '">' + hc[0] + '</span>'); }
+                        }
+                        if (life !== '') {
+                            var ln = parseInt(life, 10);
+                            var lc = '#1a7f37';
+                            if (ln <= 10) { lc = '#c00000'; }
+                            else if (ln <= 30) { lc = '#b26a00'; }
+                            parts.push(gettext('寿命') + ' <span style="color:' + lc + '">' + life + '%</span>');
+                        }
+                        if (rd || wr) {
+                            parts.push((rd ? gettext('读') + ' ' + rd : '') +
+                                       (rd && wr ? '&nbsp; ' : '') +
+                                       (wr ? gettext('写') + ' ' + wr : ''));
+                        }
+                        return parts.join('&nbsp; ');
                     }).join('<br/>');
                 } catch (e) { return '-'; }
             },
@@ -1373,7 +1544,7 @@ Ext.define('PVE.node.HwTools', {
                     items: [
                         mkCb('显示 CPU 温度（封装与核心平均）', 'show_cpu_temp'),
                         mkCb('显示风扇转速', 'show_fan'),
-                        mkCb('显示硬盘概要（型号 / 容量 / 温度）', 'show_disk'),
+                        mkCb('显示硬盘概要（型号 / 容量 / 温度 / 健康 / 读写）', 'show_disk'),
                         mkCb('显示 CPU 频率', 'show_cpu_freq'),
                     ],
                 },
