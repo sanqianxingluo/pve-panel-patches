@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V3.1
+# 版本：V3.2
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -950,7 +950,7 @@ items = """            textField: 'pveversion',
         },
         {
             itemId: 'hw-cputemp',
-            colspan: 1,
+            colspan: 2,
             printBar: false,
             title: gettext('CPU温度'),
             textField: 'tdata',
@@ -960,7 +960,7 @@ items = """            textField: 'pveversion',
         },
         {
             itemId: 'hw-board',
-            colspan: 1,
+            colspan: 2,
             printBar: false,
             title: gettext('主板温度'),
             textField: 'tdata',
@@ -970,7 +970,7 @@ items = """            textField: 'pveversion',
         },
         {
             itemId: 'hw-cpucores',
-            colspan: 1,
+            colspan: 2,
             printBar: false,
             title: gettext('CPU核心温度'),
             textField: 'tdata',
@@ -987,7 +987,7 @@ items = """            textField: 'pveversion',
         },
         {
             itemId: 'hw-fans',
-            colspan: 1,
+            colspan: 2,
             printBar: false,
             title: gettext('风扇转速'),
             textField: 'tdata',
@@ -1013,7 +1013,7 @@ items = """            textField: 'pveversion',
         },
         {
             itemId: 'hw-cpufreq',
-            colspan: 1,
+            colspan: 2,
             printBar: false,
             title: gettext('CPU频率'),
             textField: 'tdata',
@@ -1037,7 +1037,7 @@ items = """            textField: 'pveversion',
         },
         {
             itemId: 'hw-disktemp',
-            colspan: 1,
+            colspan: 2,
             printBar: false,
             title: gettext('硬盘温度'),
             textField: 'tdata',
@@ -1131,8 +1131,6 @@ ui = """
 PVE.HW = PVE.HW || {};
 
 // 隐藏开关关掉的概要行（配置改动后无需重新登录：每次装载概要存储都会重新判读）。
-// 每条目占一行的高度（实测：六条 = 480，故每条 24px，超出即高度不足而出现滚动条）
-PVE.HW.ROW = 24;
 // 百分号编码的名字 → 可读文本（后端为避免 Perl 二次编码，名字以 %XX 传递）
 PVE.HW.dec = function (x) {
     if (!x) { return ''; }
@@ -1145,8 +1143,6 @@ PVE.HW.enc = function (x) {
     try { return encodeURIComponent(x); } catch (e) { return ''; }
 };
 
-PVE.HW.BASE = 480;
-
 // 全部硬件概要条目（供复位用）
 PVE.HW.ALL = [
     'hw-header',
@@ -1157,6 +1153,43 @@ PVE.HW.ALL = [
     'hw-disktemp',
     'hw-cpufreq',
 ];
+
+// 高度按**内容实测**来定，不写死数字。
+// 旧法用 `BASE(480) - 隐藏数 × ROW(24)` 估算，在「每项整行（colspan:2）」+
+// 「半幅宽面板」下彻底失准：条目高度并不相同（CPU频率两行、硬盘可能多块盘），
+// 480 也不再是基线，结果是每轮存储刷新都把面板压回 480、把最后一行裁掉。
+// 新法：直接量「最后一个可见条目」的底边，据此算面板该多高——既能撑开也能收回
+// （开关关掉几行时不留空档），且自适应任何条目数与任意机型。
+PVE.HW.fit = function (panel) {
+    if (!panel.el || !panel.body || !panel.body.dom) { return; }
+    var dom = function (c) { return c && c.el ? c.el.dom : null; };
+    var bodyRect = panel.body.dom.getBoundingClientRect();
+    var padBottom = 15;                 // 与 bodyPadding '15 5 15 5' 的下边距一致
+    var lastBottom = 0;
+    var items = panel.items.getRange();
+    for (var i = 0; i < items.length; i++) {
+        var d = dom(items[i]);
+        if (!d || d.offsetHeight <= 0) { continue; }   // 已隐藏的跳过
+        var b = d.getBoundingClientRect().bottom;
+        if (b > lastBottom) { lastBottom = b; }
+    }
+    if (lastBottom <= 0) { return; }
+    // 面板高 = 非 body 部分（表头/边框/内边距）+ 需要的 body 高度
+    var chrome = Math.max(0, panel.getHeight() - panel.body.dom.clientHeight);
+    var target = Math.round(chrome + (lastBottom - bodyRect.top) + padBottom);
+    if (Math.abs(target - panel.getHeight()) <= 1) { return; }
+    panel.setHeight(target);
+    if (panel.ownerCt && panel.ownerCt.updateLayout) { panel.ownerCt.updateLayout(); }
+};
+
+// 一次 fit 的读数可能偏小：把**显示**回来的行刚 .show() 时，DOM 还没重排完，
+// 量到的底边会比最终矮（实测复位 6 行后 first-pass 只读到 544，实际应为 595）。
+// 故 hide() 走完后还要延后补测两拍，让高度收敛到正确值（幂等，收敛后不再改动）。
+PVE.HW.fitSoon = function (panel) {
+    PVE.HW.fit(panel);
+    Ext.defer(function () { PVE.HW.fit(panel); }, 60);
+    Ext.defer(function () { PVE.HW.fit(panel); }, 260);
+};
 
 // 按配置隐藏。先**全部复位**再隐藏该隐的——否则开关从 0 改回 1 后，
 // 先前隐藏的行不会自己回来（V2 初版即漏了这步）。
@@ -1190,8 +1223,8 @@ PVE.HW.hide = function (panel) {
             }
         }
     }
-    // 高度随隐藏的行数递减
-    panel.setHeight(Math.max(150, PVE.HW.BASE - hidden.length * PVE.HW.ROW));
+    // 高度按实测内容自适应（不写死数字，见 PVE.HW.fit 的说明）
+    PVE.HW.fitSoon(panel);
 };
 
 // 保存配置后置位，令概要面板在下一轮刷新时重新取一次开关
@@ -1249,6 +1282,45 @@ PVE.HW.attach = function (panel, nodename) {
     var sw = null;
     try { sw = readSwitches(); } catch (e) { sw = null; }
     apply(sw);
+
+    // ---- 版面：概要占半幅，让图表流到右侧 ----
+    // 宿主源码里 nodeStatus 本来就写着 width: 770，但父容器 #itemcontainer 的
+    // defaults 有 columnWidth: 1，在 ExtJS 里 **columnWidth 优先级高于 width**，
+    // 于是 770 被无视、面板被拉满整幅（实测 1121px）。表现就是每行标签贴最左、
+    // 数值贴最右、中间一大段空白，整块「看着很空」。
+    // 修法：把概要设成半幅（columnWidth 0.5），并把紧随其后的第一个图表也设半幅，
+    // 两者并排一行；其余图表仍旧整幅。columnWidth 是**比例**，窗口缩放会自适应。
+    var applyLayout = function () {
+        var host = panel.ownerCt;             // #itemcontainer（column 布局）
+        if (!host || !host.items) { return false; }
+        if (!panel.el || !panel.rendered) { return false; }
+        // 注意：ExtJS 7.0.0.168 里 **没有** panel.setColumnWidth() 这个方法
+        // （typeof 为 undefined），必须直接改 columnWidth 属性，再让父容器重排。
+        // 用 setColumnWidth 会被守卫吞掉、静默不生效（踩过）。
+        panel.columnWidth = 0.5;
+        // 只挑「第一张图」陪跑；后面的图表保持整幅，行自然向下排
+        var kids = host.items.getRange();
+        var done = 0;
+        for (var i = 0; i < kids.length && done < 1; i++) {
+            var c = kids[i];
+            if (c === panel) { continue; }
+            c.columnWidth = 0.5;
+            done++;
+        }
+        if (host.updateLayout) { host.updateLayout(); }
+        else if (host.doLayout) { host.doLayout(); }
+        return true;
+    };
+    // attach() 是在 Ext.create 之后**立刻**调用的（见 HOME:BEGIN 注入点），
+    // 此时面板还没被 add 进 #itemcontainer，ownerCt 为 null，afterrender 也未必
+    // 早于容器布局。因此用**带重试**的方式，直到父容器与渲染都就位为止。
+    var tries = 0;
+    var kick = function () {
+        if (applyLayout()) { return; }
+        if (++tries <= 25) { Ext.defer(kick, 200); }
+    };
+    kick();
+
     var run = function () { PVE.HW.hide(panel); };
     if (panel.rendered) {
         run();
@@ -2353,8 +2425,9 @@ if _src:
                      "       请改用 HTML 标签（<br/>）或 String.fromCharCode。"
                      % _blk[max(0, _m.start()-50):_m.start()+50].replace("\n", " / "))
 
-# 概要面板高度基线
-s = re.sub(r"(alias: 'widget\.pveNodeStatus',<br/><br/>    height: )\d+(,)", r"\g<1>480\g<2>", s, count=1)
+# 概要面板高度不再写死：本补丁的 PVE.HW.fit() 会按可见条目实测高度自适应。
+# （旧的「把 nodeStatus 的 height 钉成 480」正则早已命中不了——宿主源码里该处是
+#  直接换行，不是 <br/><br/> 分隔，正则写死了错的形态；且写死高度会裁掉末行。）
 
 # 注意：**不能**因为 s == orig 就报错。已打过补丁的文件再跑一遍时，
 # 「移除旧块 + 重新注入」恰好等于原文，s == orig 是正常结果；若判为失败并回滚，
