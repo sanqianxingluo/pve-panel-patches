@@ -1,6 +1,6 @@
 # Proxmox VE 面板补丁集
 
-> **当前版本：V3.3** · 发布于 2026-09-26
+> **当前版本：V3.4** · 发布于 2026-09-26
 > 适用：**Proxmox VE 9.x**（在 `pve-manager` 9.2.20 上实测通过）· 需 root
 
 给 PVE 原生 Web 界面补上它不显示的东西：**节点概要的硬件信息**、
@@ -810,6 +810,13 @@ apt 钩子没挂上。检查 `apt-config dump | grep -i post-invoke`，
 ---
 
 ## 更新日志
+
+**V3.4**（2026-09-26）
+- **修掉概要页约 1 秒的延迟**：点进概要要等约 2 秒，其中约 1.5 秒全花在硬件采集接口 `/nodes/{node}/hwtools` 上（其余 API 只有 6–150 ms）。
+- 根因在 `pve-hwtools-agent` 的风扇探测：`for f in "$d"/pwm[0-9]*` 在 nct6798 芯片上会匹配到 **138 个文件**（`pwm1_auto_point1_pwm` 这类全中），而循环里每轮都 fork 一次 `basename` —— 单次 `status` 累积 700+ 个子进程。
+- 修法：① 用 bash 内置参数展开 `${f##*/}` 取代 `basename`（去掉 fork）；② glob 收窄成 `pwm[0-9]` / `pwm[0-9][0-9]`，只取「裸 pwmN」，完全不碰带后缀的文件；③ 给 `fan_dir_fingerprint` / `fan_chip_dir` 加**记忆化**（`status` 一行 JSON 里会被调用十几次，且 `$( )` 子 shell 求值不继承赋值，故在父 shell 先预热一次）。
+- 效果：`status` 从 **1.46 s → 0.44 s**；接口 **1483 ms → 475 ms**；点进概要从 **1.91 s → 1.03 s**。JSON 输出逐字段一致（仅 `freq_cur` 实时频率随负载变动）。
+- 结论提示：pvproxy 对**认证失败**的请求（401）会故意延时约 3 秒（`AccessControl.pm` 注释即写明 "some plugins delay/sleep if auth fails"），用不带票据的 curl 探接口会误判成「所有接口都 3 秒」；已登录会话不受影响。
 
 **V3.3**（2026-09-26）
 - **「硬盘温度」升级为「硬盘概要」**：除型号与温度外，新增**健康状态**（正常 / 警告 / 异常，带颜色）、**剩余寿命百分比**、**累计读取与写入量**。

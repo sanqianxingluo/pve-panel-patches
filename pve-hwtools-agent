@@ -246,35 +246,55 @@ fan_chip_rank() {
 }
 
 # 某个 hwmon 目录里是否存在**可写的裸 pwmN**
+# 性能注：pwm[0-9]* 在 nct6798 上能匹配到 138 个文件（pwm1_auto_point1_pwm…）。
+# 这里原来每轮 fork 一次 basename，累积几百个子进程，单次 status 要多花约 1 秒。
+# 改用 bash 内置参数展开 ${f##*/} 去掉 fork；再用 pwm[0-9] / pwm[0-9][0-9] 两个
+# 精确 glob 只取「裸 pwmN」，完全不碰 pwm1_enable 这类带后缀的文件。
 fan_dir_usable() {
-  local d="$1" f b n
-  for f in "$d"/pwm[0-9]*; do
-    [ -e "$f" ] || continue
-    b=$(basename "$f"); n=${b#pwm}
-    case "$n" in ''|*[!0-9]*) continue ;; esac   # 跳过 pwm1_enable 这类带后缀的
-    [ -w "$f" ] && return 0
+  local d="$1" f n
+  for f in "$d"/pwm[0-9] "$d"/pwm[0-9][0-9]; do
+    [ -w "$f" ] || continue
+    n=${f##*/}; n=${n#pwm}
+    case "$n" in ''|*[!0-9]*) continue ;; esac   # 双保险：跳过带后缀的
+    return 0
   done
   return 1
 }
 
 # 某个 hwmon 目录的通道指纹：形如 "1,2,3,4,5,7"
+# 结果按目录记忆化（同一次运行内 sysfs 不会变），避免 status 里反复重扫。
+_FAN_FP_CACHE_DIR=""
+_FAN_FP_CACHE_VAL=""
 fan_dir_fingerprint() {
-    local d="$1" f b n out=""
-    for f in "$d"/pwm[0-9]*; do
+    local d="$1" f n out=""
+    if [ "$d" = "$_FAN_FP_CACHE_DIR" ]; then printf '%s' "$_FAN_FP_CACHE_VAL"; return 0; fi
+    for f in "$d"/pwm[0-9] "$d"/pwm[0-9][0-9]; do
       [ -e "$f" ] || continue
-      b=$(basename "$f"); n=${b#pwm}
+      n=${f##*/}; n=${n#pwm}
       case "$n" in ''|*[!0-9]*) continue ;; esac
       case " $out " in *" $n "*) ;; *) out="$out $n" ;; esac
     done
     # 必须**按数字**排序。shell 的 glob 展开是字典序，通道号上两位数就会露馅：
     # 1..10 会排成 "1 10 2 3 …"，界面于是把「通道 10」排在「通道 1」后面，
     # hwid 指纹也跟着变得难看。sort -n 之后才是 1,2,…,10。
-    [ -n "$out" ] || { printf ''; return 0; }
-    printf '%s' "$(printf '%s' "${out# }" | tr ' ' '\n' | grep -v '^$' | sort -n | tr '\n' ',' | sed 's/,$//')"
+    _FAN_FP_CACHE_DIR="$d"
+    if [ -n "$out" ]; then
+      _FAN_FP_CACHE_VAL="$(printf '%s' "${out# }" | tr ' ' '\n' | grep -v '^$' | sort -n | tr '\n' ',' | sed 's/,$//')"
+    else
+      _FAN_FP_CACHE_VAL=""
+    fi
+    printf '%s' "$_FAN_FP_CACHE_VAL"
 }
 
 # 按能力找芯片目录（型号只影响排序，不影响能不能找到）
+# 记忆化：status 一行 JSON 里 fan_avail/fan_chip/fan_hwid/fans/fan_sources 都会要它，
+# 不缓存就要把 4 个 hwmon 目录扫 10 遍以上。
+_FAN_CHIP_DIR_CACHE="__unset__"
 fan_chip_dir() {
+  if [ "$_FAN_CHIP_DIR_CACHE" != "__unset__" ]; then
+    [ -n "$_FAN_CHIP_DIR_CACHE" ] || return 1
+    printf '%s' "$_FAN_CHIP_DIR_CACHE"; return 0
+  fi
   local best="" bestrank=99 h n rank
   for h in /sys/class/hwmon/hwmon*; do
     [ -r "$h/name" ] || continue
@@ -283,8 +303,9 @@ fan_chip_dir() {
     rank=$(fan_chip_rank "$n")
     if [ -z "$best" ] || [ "$rank" -lt "$bestrank" ]; then bestrank=$rank; best=$h; fi
   done
-  [ -n "$best" ] && { printf '%s' "$best"; return 0; }
-  return 1
+  _FAN_CHIP_DIR_CACHE="$best"
+  [ -n "$best" ] || return 1
+  printf '%s' "$best"; return 0
 }
 
 # 旧名兼容（脚本其余各处仍调用 nct_dir）
@@ -444,7 +465,7 @@ fan_temp_sources() {
   local t n lbl v out=""
   for t in "$d"/temp[0-9]*_input; do
     [ -e "$t" ] || continue
-    n=$(basename "$t"); n=${n#temp}; n=${n%_input}
+    n=${t##*/}; n=${n#temp}; n=${n%_input}
     v=$(cat "$t" 2>/dev/null || echo 0)
     # 跳过明显无效的空脚（读数为 0）
     [ "$v" -gt 0 ] 2>/dev/null || continue
@@ -1156,6 +1177,10 @@ apply_epp() {
 # ---------- 状态（JSON，频率一律 MHz） ----------
 emit_status() {
   load_conf
+  # 预热记忆化缓存：`$(fan_chip_dir)` 之类是在**子 shell** 里求值的，子 shell 对
+  # 全局变量的赋值不回传父进程，所以不先在这一层调用一次的话，下面每次 $( ) 都会
+  # 把 4 个 hwmon 目录重扫一遍。这里先在父 shell 里调一次，缓存即被子 shell 继承。
+  fan_chip_dir >/dev/null 2>&1 || true
   local jg="" g
   for g in $(gov_list | tr ',' ' '); do jg="$jg\"$g\","; done
   jg="${jg%,}"
