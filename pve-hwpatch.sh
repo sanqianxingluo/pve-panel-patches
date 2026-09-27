@@ -72,13 +72,10 @@ EOC
 else
   echo "  [0] $CONF 已存在，保留"
   # 升级迁移：老配置里没有的键补上（幂等；只加不改，绝不覆盖用户已设的值）
-  for kv in "APT_MIRROR=ustc"; do
-    k="${kv%%=*}"
-    if ! grep -qE "^[[:space:]]*$k=" "$CONF"; then
-      printf '\n# 软件源镜像（ustc 中科大 / tuna 清华 / aliyun 阿里云 / tencent 腾讯云 / huawei 华为云 / official 官方源）\n%s\n' "$kv" >> "$CONF"
-      echo "  [0] 已补默认项 $k 到 $CONF"
-    fi
-  done
+  if ! grep -qE "^[[:space:]]*APT_MIRROR=" "$CONF"; then
+    printf '\n# 软件源镜像（ustc 中科大 / tuna 清华 / aliyun 阿里云 / tencent 腾讯云 / huawei 华为云 / official 官方源）\nAPT_MIRROR=ustc\n' >> "$CONF"
+    echo "  [0] 已补默认项 APT_MIRROR 到 $CONF"
+  fi
 fi
 
 # ---------- 0b) 订阅提示屏蔽：按配置执行（可屏蔽、可恢复）----------
@@ -697,37 +694,6 @@ __PACKAGE__->register_method({
     },
 });
 __PACKAGE__->register_method({
-    name => 'hwfantest',
-    path => 'hwfantest',
-    method => 'POST',
-    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Modify']] },
-    description => "让指定风扇通道短暂改变转速，便于识别对应风扇；完成后自动还原。",
-    proxyto => 'node',
-    # protected => 1 必需：pveproxy 以 www-data 跑，不带此标记会被就地降权执行，
-    # 而 fan-test 要写 sysfs（需 root）。
-    protected => 1,
-    parameters => {
-        additionalProperties => 0,
-        properties => {
-            node => get_standard_option('pve-node'),
-            channel => { type => 'integer', minimum => 1, maximum => 32 },
-        },
-    },
-    returns => { type => 'object', properties => {} },
-    code => sub {
-        my ($param) = @_;
-        my $out = '';
-        eval {
-            run_command(['/usr/local/bin/pve-hwtools-agent', 'fan-test', "$param->{channel}"],
-                        outfunc => sub { $out .= shift });
-        };
-        die "测试失败：$@\n" if $@;
-        my $res = {};
-        eval { $res = decode_json($out) };
-        return $res;
-    },
-});
-__PACKAGE__->register_method({
     name => 'hwfanbind',
     path => 'hwfanbind',
     method => 'POST',
@@ -976,6 +942,8 @@ PY
   perl -c "$N" >/dev/null 2>&1 || { echo "  perl 语法校验失败，回滚"; cp -a "$BK/Nodes.pm.bak.hwpatch" "$N"; exit 1; }
   echo "  [2] perl 语法校验通过"
   if grep -q "^backend_changed=1$" /var/run/pve-hwpatch.flags 2>/dev/null; then
+    # 后端真改动才重启：否则 agent 每次保存都会触发本脚本，从而重启正在处理
+    # 该请求的 pvedaemon 自己 → 请求被掐断 → HTTP 596 broken pipe（见第 2 段注释）。
     backend_changed=1
   fi
 
