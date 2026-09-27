@@ -225,6 +225,10 @@ PWM_MAX=255
 pwm_pct_to_raw() { printf '%s' "$(( ($1 * PWM_MAX + 50) / 100 ))"; }   # 四舍五入
 pwm_raw_to_pct() { printf '%s' "$(( ($1 * 100 + $((PWM_MAX / 2))) / PWM_MAX ))"; }
 FAN_REGISTRY=/usr/local/lib/pve-hwtools/fanscan.conf
+# 风扇曲线自愈日志：顺序违规的点被就地重置时留痕。
+#   apply 路径的 stderr 被吞（systemd 环境下看不到），故必须落盘才查得到。
+FAN_LOG=/var/log/pve-hwtools-fan.log
+fan_log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$FAN_LOG" 2>/dev/null; return 0; }
 
 # 已知 Super I/O 家族（**只用于排序**，不是准入门槛）
 fan_chip_rank() {
@@ -509,9 +513,10 @@ fan_restore_baseline() {
   return 0
 }
 
-# 校验曲线：形如 25:12,30:24,45:47,60:78,80:100 —— 恰 5 点，温度严格升序，占空比 1~100%
+# 校验曲线：形如 25:12,30:24,45:47,60:78,80:100 —— 恰 5 点，温度**不递减**（允许持平），
+#   占空比同样**不递减**，且都落在合法区间。非法则 die（整批不生效）。
 valid_curve() {
-  local v="$1" pts t w prev=-1 out=""
+  local v="$1" pts t w out="" i=0 pt=0 pw=0
   IFS=',' read -ra pts <<< "$v"
   [ "${#pts[@]}" = 5 ] || die "曲线必须是 5 个点（温度:占空比%，逗号分隔），现为 ${#pts[@]} 个"
   for p in "${pts[@]}"; do
@@ -520,11 +525,52 @@ valid_curve() {
     case "$w" in ''|*[!0-9]*) die "曲线占空比必须是整数百分比：$p" ;; esac
     [ "$t" -ge 0 ] && [ "$t" -le 120 ] || die "曲线温度应在 0~120℃：$p"
     [ "$w" -ge "$FAN_PWM_PCT_MIN" ] && [ "$w" -le 100 ] || die "曲线占空比应在 $FAN_PWM_PCT_MIN~100%：$p"
-    [ "$t" -gt "$prev" ] || die "曲线温度必须严格递增（前一点 $prev，当前 $t）"
-    prev=$t
+    if [ "$i" -gt 0 ]; then
+      [ "$t" -ge "$pt" ] || die "曲线温度不得递减（第 $((i)) 点 $pt → 第 $((i+1)) 点 $t 低于前者）"
+      [ "$w" -ge "$pw" ] || die "曲线占空比不得递减（第 $((i)) 点 $pw% → 第 $((i+1)) 点 $w% 低于前者）"
+    fi
+    pt="$t"; pw="$w"; i=$((i+1))
     out="$out$t:$w,"
   done
   VALID="${out%,}"
+}
+
+# 曲线五点归一化：把**顺序违规**的点就地重置成前一个档位 —— 温度取前一点的温度，
+#   占空比取前一点的占空比，其余点不动。用于施加前的兜底与配置读入时的自愈，
+#   保证下发给主板的曲线绝不出现回折/倒挂（防止驱动层出现未定义行为）。
+#
+#   与 valid_curve 的分工：
+#     valid_curve      —— 校验并**拒绝**（非法即整批不生效），用于把关用户输入；
+#     curve_normalize  —— 校验并**修复**（把越界点拉回前一档），用于兜底。
+#   两者共用同一套判据：温度、占空比都**不得递减**（允许持平）。
+#
+#   参数：$1=曲线串   输出：写入全局 CURVE_NORM，返回值 0 表示已归一化
+#   副作用：CURVE_FIXED=1 表示发生过改写。**刻意不用 $( ) 调用**——子 shell 里
+#   改变量传不出来（CURVE_FIXED 会恒为空，静默漏报）。故结果走全局变量。
+CURVE_NORM=""
+CURVE_FIXED=0
+curve_normalize() {
+  local v="$1" pts t w out="" i=0 pt=0 pw=0
+  CURVE_NORM=""; CURVE_FIXED=0
+  IFS=',' read -ra pts <<< "$v"
+  [ "${#pts[@]}" = 5 ] || return 1     # 点数不对属结构错误，交给 valid_curve 报错
+  for p in "${pts[@]}"; do
+    t="${p%%:*}"; w="${p##*:}"
+    case "$t" in ''|*[!0-9]*) return 1 ;; esac
+    case "$w" in ''|*[!0-9]*) return 1 ;; esac
+    if [ "$i" -eq 0 ]; then
+      pt="$t"; pw="$w"                 # 首点无从比较，作为基准
+    else
+      # 低于前一点 → 就地重置成前一个档位（温度取前点温度，占空比取前点占空比）
+      if [ "$t" -lt "$pt" ]; then t="$pt"; CURVE_FIXED=1; fi
+      if [ "$w" -lt "$pw" ]; then w="$pw"; CURVE_FIXED=1; fi
+      pt="$t"; pw="$w"
+    fi
+    out="$out$t:$w,"
+    i=$((i+1))
+  done
+  CURVE_NORM="${out%,}"
+  return 0
 }
 
 valid_fan_mode() { case "$1" in off|auto|manual) VALID="$1" ;; *) die "风扇模式只能是 off / auto / manual：$1" ;; esac; }
@@ -859,6 +905,20 @@ fan_apply_one() {   # $1=通道号
   local sel;  eval "sel=\${${var}_SEL:-2}"
   local man;  eval "man=\${${var}_MANUAL:-50}"
   local curve; eval "curve=\${${var}_CURVE:-}"
+
+  # 兜底：下发前把顺序违规的点就地重置成前一个档位。
+  #   配置可能被手工改坏（绕过 set 的校验），apply 走的是这条路径。
+  #   不用 $( ) 调用：子 shell 里 CURVE_NORM/CURVE_FIXED 传不回来。
+  #   提示同时写 stderr 与日志文件 —— apply 的 stderr 在 systemd 下会被吞掉。
+  if [ -n "$curve" ]; then
+    curve_normalize "$curve" && {
+      if [ "$CURVE_FIXED" = 1 ]; then
+        echo "  风扇 $n 曲线顺序不合规，已就地重置成前一档：$curve → $CURVE_NORM" >&2
+        fan_log "通道 $n 曲线顺序不合规，已就地重置成前一档：$curve → $CURVE_NORM"
+        curve="$CURVE_NORM"
+      fi
+    }
+  fi
 
   local before; before=$(fan_rpm "$n")
   fan_save_baseline "$n"

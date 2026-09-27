@@ -1820,13 +1820,16 @@ Ext.define('PVE.node.HwTools', {
                               html: '<span style="color:#888">' + gettext('曲线') + '</span>' }],
                 });
                 cpts.forEach(function (x, i) {
+                    // change 时就地纠正：填小了立刻被拉回前一档，避免顺序倒挂下发主板
                     crow.add({ xtype: 'numberfield', name: 'fan' + n + '_pt' + i + '_t',
                                width: 58, emptyText: gettext('温度'), minValue: 0, maxValue: 120,
-                               value: x.t, hideLabel: true, margin: '0 4 0 0' });
+                               value: x.t, hideLabel: true, margin: '0 4 0 0',
+                               listeners: { change: function () { me.fanFixCurve(n); } } });
                     crow.add({ xtype: 'component', margin: '6 4 0 0', html: '℃ →' });
                     crow.add({ xtype: 'numberfield', name: 'fan' + n + '_pt' + i + '_w',
                                width: 58, emptyText: gettext('占空比%'), minValue: 1, maxValue: 100,
-                               value: x.w, hideLabel: true, margin: '0 10 0 0' });
+                               value: x.w, hideLabel: true, margin: '0 10 0 0',
+                               listeners: { change: function () { me.fanFixCurve(n); } } });
                 });
                 fs.add(crow);
 
@@ -2004,6 +2007,33 @@ Ext.define('PVE.node.HwTools', {
                     });
                 },
             });
+        },
+
+        // 曲线顺序自愈：把**低于前一点**的温度/占空比就地重置成前一点的档位，
+        //   其余点不动，用户可继续编辑。防的是顺序倒挂下发给主板（驱动层未定义行为）。
+        //   与后端 valid_curve 同一判据：不得递减（允许持平）。
+        fanFixCurve: function (n) {
+            var me = this;
+            if (me._fanFixing) { return; }      // setValue 会再触发 change，防递归
+            var tf = [], wf = [], t = [], w = [], i, v;
+            for (i = 0; i < 5; i++) {
+                tf.push(me.down('[name=fan' + n + '_pt' + i + '_t]'));
+                wf.push(me.down('[name=fan' + n + '_pt' + i + '_w]'));
+                if (!tf[i] || !wf[i]) { return; }
+            }
+            for (i = 0; i < 5; i++) {
+                var tv = tf[i].getValue(), wv = wf[i].getValue();
+                // 有空格没填时先不纠正，免得把半截输入当成 0
+                if (tv === null || tv === '' || wv === null || wv === '') { return; }
+                t.push(Math.round(Number(tv)));
+                w.push(Math.round(Number(wv)));
+            }
+            me._fanFixing = true;
+            for (i = 1; i < 5; i++) {
+                if (t[i] < t[i - 1]) { tf[i].setValue(t[i - 1]); t[i] = t[i - 1]; }
+                if (w[i] < w[i - 1]) { wf[i].setValue(w[i - 1]); w[i] = w[i - 1]; }
+            }
+            me._fanFixing = false;
         },
 
         // 按模式启用/禁用该通道的控件——别让人填了不生效的东西
@@ -2440,7 +2470,7 @@ Ext.define('PVE.node.HwTools', {
             } else if (mode === 'auto') {
                 var sel = me.fanVal('fan' + n + '_sel');
                 if (sel) { kv.push('fan' + n + '_sel=' + sel); }
-                var pts = [], last = -1;
+                var pts = [], lastT = -1, lastW = -1;
                 for (var i = 0; i < 5; i++) {
                     var t = me.fanVal('fan' + n + '_pt' + i + '_t');
                     var w = me.fanVal('fan' + n + '_pt' + i + '_w');
@@ -2449,11 +2479,15 @@ Ext.define('PVE.node.HwTools', {
                         return;
                     }
                     t = Math.round(t); w = Math.round(w);
-                    if (t <= last) {
-                        fanErr = gettext('通道 ') + n + gettext(' 的曲线温度必须由低到高（第 ') + (i + 1) + gettext(' 点不大于前一点）。');
+                    if (t < lastT) {
+                        fanErr = gettext('通道 ') + n + gettext(' 的曲线温度不得递减（第 ') + (i + 1) + gettext(' 点低于前一点）。');
                         return;
                     }
-                    last = t;
+                    if (w < lastW) {
+                        fanErr = gettext('通道 ') + n + gettext(' 的曲线占空比不得递减（第 ') + (i + 1) + gettext(' 点低于前一点）。');
+                        return;
+                    }
+                    lastT = t; lastW = w;
                     pts.push(t + ':' + w);
                 }
                 kv.push('fan' + n + '_curve=' + pts.join(','));

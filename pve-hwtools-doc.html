@@ -33,7 +33,7 @@
 <div class="pve-hwtools-doc">
 <h1>Proxmox VE 面板补丁集</h1>
 <blockquote>
-<p><strong>当前版本：V3.6</strong> · 发布于 2026-09-27
+<p><strong>当前版本：V3.7</strong> · 发布于 2026-09-27
 适用：<strong>Proxmox VE 9.x</strong>（在 <code>pve-manager</code> 9.2.20 上实测通过）· 需 root</p>
 </blockquote>
 <p>给 PVE 原生 Web 界面补上它不显示的东西：<strong>节点概要的硬件信息</strong>、
@@ -464,10 +464,12 @@ CPU 插座温度 （推荐） · 40.0 °C      ← CPUTIN，CPU 插座处
 <p>模式为「关闭」时，该列显示的是<strong>主板当前实际在跟的温度源</strong>。</p>
 </blockquote>
 <h4>曲线怎么写</h4>
-<p>五个点，形如「温度 → 占空比%」，<strong>温度必须严格递增</strong>：</p>
+<p>五个点，形如「温度 → 占空比%」。<strong>温度和占空比都不得递减</strong>（允许持平）：</p>
 <pre><code>FAN1_CURVE=25:12,30:24,45:47,60:78,80:100
               ↑ 25°C 时 12%   ↑ 30°C 时 24%  …  ↑ 80°C 时 100%（满速）
 </code></pre>
+<p>填错会自动纠正：<strong>某一点低于前一点时，该点就地重置成前一点的温度与占空比</strong>，
+其余点不动，可继续编辑。面板里改一个框就立即生效，不必等保存。</p>
 <p>温度单位写摄氏度，脚本会折成芯片要的毫摄氏度。</p>
 <h4>自动识别风扇</h4>
 <p>分组顶部的「<strong>自动识别风扇</strong>」按钮，做两件<strong>能被证实</strong>的事：</p>
@@ -548,6 +550,9 @@ pve-hwtools-agent fan-scan                        # 看探测缓存
 <li><strong>基线只在首次创建、绝不覆盖</strong></li>
 <li>施加后 3 秒复读转速：<strong>原本在转、现在变 0 → 立即还原并报错</strong></li>
 <li>手动占空比下限强制 <code>&gt;= 1%</code>，<strong>绝不写 0</strong></li>
+<li><strong>曲线顺序自愈</strong>：某点低于前一点时<strong>就地重置成前一档</strong>（温度取前点温度、占空比取前点占空比），
+  其余点不动；面板里即时纠正，<code>apply</code> 前再兜底一次（配置被手工改坏也拦得住）。
+  每条重置都记进 <code>/var/log/pve-hwtools-fan.log</code></li>
 <li><code>auto</code> 模式<strong>先铺好曲线、最后才写 <code>enable</code></strong>，避免中途以半截曲线运行</li>
 <li>手动定值<strong>先写 <code>enable</code>、再写 <code>pwm</code></strong></li>
 <li>自动识别<strong>只试静止的插针</strong>，正在转的绝不打扰</li>
@@ -687,7 +692,7 @@ APT_MIRROR=ustc               # ustc/tuna/aliyun/tencent/huawei/official
 #   FANn_MODE   off / auto / manual
 #   FANn_SEL    温度源编号（1=SYSTIN 2=CPUTIN 8=PECI…）
 #   FANn_MANUAL 手动占空比百分比 1~100
-#   FANn_CURVE  五个点「温度:占空比%」，温度须严格递增
+#   FANn_CURVE  五个点「温度:占空比%」，温度与占空比均不得递减
 FAN1_MODE=off
 FAN1_SEL=2
 FAN1_MANUAL=128
