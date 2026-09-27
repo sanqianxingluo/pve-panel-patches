@@ -716,11 +716,14 @@ EOF
 # ═══════════════════════════════════════════════════════════════
 FANPROG=/run/pve-hwtools-fanbind.json
 
-fan_prog() {
-  # 进度文件：面板按它显示阶段与百分比
+# 进度文件（面板按它轮询显示阶段与百分比）：风扇识别与升级两条流程共用同一格式，
+# 只有落盘路径不同——合成一处，免得以后改字段时漏改另一边。
+prog_write() {   # $1=目标文件 $2=state $3=step $4=pct [$5=result JSON]
   printf '{"state":"%s","step":"%s","pct":%s,"ts":%s,"result":%s}\n' \
-    "$1" "$2" "$3" "$(date +%s)" "${4:-null}" > "$FANPROG" 2>/dev/null
+    "$2" "$3" "$4" "$(date +%s)" "${5:-null}" > "$1" 2>/dev/null
+  return 0
 }
+fan_prog() { prog_write "$FANPROG" "$@"; }
 
 # 找出 PECI（CPU 自身温度）对应的 tempN 编号——不同主板编号不同，必须按名字找
 peci_temp_index() {
@@ -1282,11 +1285,7 @@ UPGRADE_LOG=/var/log/pve-hwtools-upgrade.log
 FALLBACK_CONF=/usr/local/lib/pve-hwtools/kernel-fallback.conf
 UPGRADE_CACHE=/usr/local/lib/pve-hwtools/upgrade-cache.json
 
-upg_prog() {   # $1=state $2=step $3=pct [$4=result JSON]
-  printf '{"state":"%s","step":"%s","pct":%s,"ts":%s,"result":%s}\n' \
-    "$1" "$2" "$3" "$(date +%s)" "${4:-null}" > "$UPGRADE_PROG" 2>/dev/null
-  return 0
-}
+upg_prog() { prog_write "$UPGRADE_PROG" "$@"; }
 upg_log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$UPGRADE_LOG" 2>/dev/null; return 0; }
 
 # 已装内核版本，新→旧。只认「发行版号-pve」形态；series 元包 / headers / dbg 都不算。
@@ -1345,20 +1344,16 @@ fallback_save() {   # $1=内核版本 $2=包名逗号分隔
   return 0
 }
 
-kernel_hold() {   # $1=内核版本：把它全部已装包钉住
+# 钉住 / 解除钉住某内核的全部已装包：$1=内核版本 $2=hold|unhold
+kernel_mark() {
   local plist
   plist=$(kernel_pkgs_for "$1" | tr '\n' ' ')
   [ -n "${plist// /}" ] || return 1
-  apt-mark hold $plist >>"$UPGRADE_LOG" 2>&1
+  apt-mark "$2" $plist >>"$UPGRADE_LOG" 2>&1
   return $?
 }
-kernel_unhold() {
-  local plist
-  plist=$(kernel_pkgs_for "$1" | tr '\n' ' ')
-  [ -n "${plist// /}" ] || return 1
-  apt-mark unhold $plist >>"$UPGRADE_LOG" 2>&1
-  return $?
-}
+kernel_hold()   { kernel_mark "$1" hold; }     # $1=内核版本：把它全部已装包钉住
+kernel_unhold() { kernel_mark "$1" unhold; }
 
 # 记录并钉住「当前运行内核」= 回退的退路
 protect_running_kernel() {

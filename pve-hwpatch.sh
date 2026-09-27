@@ -553,6 +553,69 @@ s = s.replace(a1, a1 + "\n        # PVE_HWPATCH\n        $res->{tdata} = `/usr/b
 a2 = "use base qw(PVE::RESTHandler);\n"
 if a2 not in s:
     sys.exit("ERROR: 后端 API 锚点失配——未找到 'use base qw(PVE::RESTHandler);'")
+# 这 4 个接口结构完全相同（只差 name / path / desc / why / properties / agent 子命令），
+# 用一份模板 + 数据表生成——比手抄 4 遍少约 90 行，且以后改公共字段只改一处。
+# 生成的 Perl 与手写版逐字节一致（改完用 cmp 与快照比对验证过）。
+UPK_TPL = r"""__PACKAGE__->register_method({
+    name => '___NAME___',
+    path => '___PATH___',
+    method => 'GET',
+    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Modify']] },
+    description => "___DESC___",
+    proxyto => 'node',
+    # protected => 1：___WHY___
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+___PROPS___    },
+    returns => { type => 'object', properties => {} },
+    code => sub {
+        my ($param) = @_;
+___CMD___        my $res = {};
+        eval { $res = decode_json($out) };
+        $res->{error} = $@ if ($@ && !$res->{error});
+        return $res;
+    },
+});"""
+SIM = r"""        properties => {
+            node     => get_standard_option('pve-node'),
+            simulate => { type => 'boolean', default => 0, optional => 1 },
+        },
+"""
+ONE = "        properties => { node => get_standard_option('pve-node') },\n"
+UPGRADE_CMD = r"""        my @cmd = ('/usr/local/bin/pve-hwtools-agent', '%s');
+        push @cmd, 'simulate' if $param->{simulate};
+        my $out = '';
+        eval {
+            run_command(\@cmd, outfunc => sub { $out .= shift }, errfunc => sub { });
+        };
+"""
+KERNEL_CMD = r"""        my $out = '';
+        eval {
+            run_command(['/usr/local/bin/pve-hwtools-agent', '%s'],
+                        outfunc => sub { $out .= shift }, errfunc => sub { });
+        };
+"""
+UPK = [
+    dict(NAME='hwupgradepve', PATH='hwupgrade-pve-get',
+         DESC='更新 PVE 软件（GET 别名）：只升软件包，内核一枚不动。面板 POST 读不到响应正文。',
+         WHY='apt dist-upgrade 必须 root。', PROPS=SIM, CMD=UPGRADE_CMD % 'upgrade-pve'),
+    dict(NAME='hwupgradekernel', PATH='hwupgrade-kernel-get',
+         DESC='更新内核（GET 别名）：装最新内核并保留旧内核，可一键回退。',
+         WHY='装内核包必须 root。', PROPS=SIM, CMD=UPGRADE_CMD % 'upgrade-kernel'),
+    dict(NAME='hwkernelrollback', PATH='hwkernel-rollback-get',
+         DESC='回退到保留的旧内核（GET 别名）：把启动项指回更新前那枚内核，重启后生效。',
+         WHY='要调 proxmox-boot-tool 改启动项（需 root）。', PROPS=ONE, CMD=KERNEL_CMD % 'kernel-rollback'),
+    dict(NAME='hwkernelrelease', PATH='hwkernel-release-get',
+         DESC='解除对旧内核的保留（GET 别名）：确认新内核一切正常后使用。',
+         WHY='要调 apt-mark 与 proxmox-boot-tool（需 root）。', PROPS=ONE, CMD=KERNEL_CMD % 'kernel-release'),
+]
+def _upk_render(m):
+    t = UPK_TPL
+    for _k, _v in m.items():
+        t = t.replace('___' + _k + '___', _v)
+    return t
+upgrade_api = '\n'.join(_upk_render(_m) for _m in UPK)
 api = a2 + '''
 # PVE_HWAPI:BEGIN
 use PVE::Tools qw(run_command);
@@ -864,122 +927,7 @@ __PACKAGE__->register_method({
         return $res;
     },
 });
-__PACKAGE__->register_method({
-    name => 'hwupgradepve',
-    path => 'hwupgrade-pve-get',
-    method => 'GET',
-    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Modify']] },
-    description => "更新 PVE 软件（GET 别名）：只升软件包，内核一枚不动。面板 POST 读不到响应正文。",
-    proxyto => 'node',
-    # protected => 1：apt dist-upgrade 必须 root。
-    protected => 1,
-    parameters => {
-        additionalProperties => 0,
-        properties => {
-            node     => get_standard_option('pve-node'),
-            simulate => { type => 'boolean', default => 0, optional => 1 },
-        },
-    },
-    returns => { type => 'object', properties => {} },
-    code => sub {
-        my ($param) = @_;
-        my @cmd = ('/usr/local/bin/pve-hwtools-agent', 'upgrade-pve');
-        push @cmd, 'simulate' if $param->{simulate};
-        my $out = '';
-        eval {
-            run_command(\@cmd, outfunc => sub { $out .= shift }, errfunc => sub { });
-        };
-        my $res = {};
-        eval { $res = decode_json($out) };
-        $res->{error} = $@ if ($@ && !$res->{error});
-        return $res;
-    },
-});
-__PACKAGE__->register_method({
-    name => 'hwupgradekernel',
-    path => 'hwupgrade-kernel-get',
-    method => 'GET',
-    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Modify']] },
-    description => "更新内核（GET 别名）：装最新内核并保留旧内核，可一键回退。",
-    proxyto => 'node',
-    # protected => 1：装内核包必须 root。
-    protected => 1,
-    parameters => {
-        additionalProperties => 0,
-        properties => {
-            node     => get_standard_option('pve-node'),
-            simulate => { type => 'boolean', default => 0, optional => 1 },
-        },
-    },
-    returns => { type => 'object', properties => {} },
-    code => sub {
-        my ($param) = @_;
-        my @cmd = ('/usr/local/bin/pve-hwtools-agent', 'upgrade-kernel');
-        push @cmd, 'simulate' if $param->{simulate};
-        my $out = '';
-        eval {
-            run_command(\@cmd, outfunc => sub { $out .= shift }, errfunc => sub { });
-        };
-        my $res = {};
-        eval { $res = decode_json($out) };
-        $res->{error} = $@ if ($@ && !$res->{error});
-        return $res;
-    },
-});
-__PACKAGE__->register_method({
-    name => 'hwkernelrollback',
-    path => 'hwkernel-rollback-get',
-    method => 'GET',
-    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Modify']] },
-    description => "回退到保留的旧内核（GET 别名）：把启动项指回更新前那枚内核，重启后生效。",
-    proxyto => 'node',
-    # protected => 1：要调 proxmox-boot-tool 改启动项（需 root）。
-    protected => 1,
-    parameters => {
-        additionalProperties => 0,
-        properties => { node => get_standard_option('pve-node') },
-    },
-    returns => { type => 'object', properties => {} },
-    code => sub {
-        my ($param) = @_;
-        my $out = '';
-        eval {
-            run_command(['/usr/local/bin/pve-hwtools-agent', 'kernel-rollback'],
-                        outfunc => sub { $out .= shift }, errfunc => sub { });
-        };
-        my $res = {};
-        eval { $res = decode_json($out) };
-        $res->{error} = $@ if ($@ && !$res->{error});
-        return $res;
-    },
-});
-__PACKAGE__->register_method({
-    name => 'hwkernelrelease',
-    path => 'hwkernel-release-get',
-    method => 'GET',
-    permissions => { check => ['perm', '/nodes/{node}', ['Sys.Modify']] },
-    description => "解除对旧内核的保留（GET 别名）：确认新内核一切正常后使用。",
-    proxyto => 'node',
-    # protected => 1：要调 apt-mark 与 proxmox-boot-tool（需 root）。
-    protected => 1,
-    parameters => {
-        additionalProperties => 0,
-        properties => { node => get_standard_option('pve-node') },
-    },
-    returns => { type => 'object', properties => {} },
-    code => sub {
-        my ($param) = @_;
-        my $out = '';
-        eval {
-            run_command(['/usr/local/bin/pve-hwtools-agent', 'kernel-release'],
-                        outfunc => sub { $out .= shift }, errfunc => sub { });
-        };
-        my $res = {};
-        eval { $res = decode_json($out) };
-        $res->{error} = $@ if ($@ && !$res->{error});
-        return $res;
-    },
-});
+''' + upgrade_api + '''
 # PVE_HWAPI:END
 '''
 s = s.replace(a2, api, 1)
