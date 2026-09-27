@@ -39,7 +39,6 @@ CPUDB="$CPUDBDIR/cpu-model.sh"
 MIRROR=/usr/local/bin/pve-mirror-switch.sh
 BK=/root/pve-upgrade-backup
 mkdir -p "$BK"
-changed=0
 backend_changed=0
 
 # ---------- 0) 配置文件（缺省全套）----------
@@ -66,10 +65,10 @@ CPU_TURBO=1
 # 能效偏好 EPP（仅部分新平台支持）
 CPU_EPP=balance_performance
 #
-ustc 中科大 / tuna 清华 / aliyun 阿里云 / tencent 腾讯云 / huawei 华为云 / official 官方源
+# 软件源镜像：ustc 中科大 / tuna 清华 / aliyun 阿里云 / tencent 腾讯云 / huawei 华为云 / official 官方源
 APT_MIRROR=ustc
 EOC
-  chmod 644 "$CONF"; changed=1; echo "  [0] 已建 $CONF"
+  chmod 644 "$CONF"; echo "  [0] 已建 $CONF"
 else
   echo "  [0] $CONF 已存在，保留"
   # 升级迁移：老配置里没有的键补上（幂等；只加不改，绝不覆盖用户已设的值）
@@ -77,7 +76,7 @@ else
     k="${kv%%=*}"
     if ! grep -qE "^[[:space:]]*$k=" "$CONF"; then
       printf '\n# 软件源镜像（ustc 中科大 / tuna 清华 / aliyun 阿里云 / tencent 腾讯云 / huawei 华为云 / official 官方源）\n%s\n' "$kv" >> "$CONF"
-      changed=1; echo "  [0] 已补默认项 $k 到 $CONF"
+      echo "  [0] 已补默认项 $k 到 $CONF"
     fi
   done
 fi
@@ -263,7 +262,7 @@ cpu_gen() {
 }
 EOCPU
   chmod 644 "$CPUDB"
-  changed=1; echo "  [0.5] 已写 $CPUDB（CPU 世代映射）"
+  echo "  [0.5] 已写 $CPUDB（CPU 世代映射）"
 else
   echo "  [0.5] $CPUDB 已是最新，跳过"
 fi
@@ -408,7 +407,7 @@ printf '{"cpu_pkg":"%s","cpu_core_avg":"%s","cpu_core_n":"%s","disks":"%s","boar
   "$(je "${CPU_PKG:--}")" "$(je "${CORE_AVG:--}")" "${CORE_N:-0}" "$(je "$DISKS")" "$(je "${BOARD:--}")" \
   "$(je "${FANS:--}")" "${CUR:-0}" "${MIN:-0}" "${MAX:-0}" "$(je "$CPUGEN")" "${BASEF:-0}"
 EOS
-  chmod +x "$SH"; changed=1; echo "  [1] 已写 $SH（v14）"
+  chmod +x "$SH"; echo "  [1] 已写 $SH（v14）"
 else
   echo "  [1] $SH 已是 v14，跳过"
 fi
@@ -481,7 +480,7 @@ chmod 644 "$TMP" 2>/dev/null
 mv -f "$TMP" "$OUT" 2>/dev/null || { rm -f "$TMP"; exit 1; }
 exit 0
 EOSM
-  chmod +x "$SMARTBIN"; changed=1; echo "  [1b] 已写 $SMARTBIN（SMART 采集器）"
+  chmod +x "$SMARTBIN"; echo "  [1b] 已写 $SMARTBIN（SMART 采集器）"
 else
   echo "  [1b] $SMARTBIN 已存在（SMART 采集器）"
 fi
@@ -498,7 +497,7 @@ After=multi-user.target
 Type=oneshot
 ExecStart=/usr/local/bin/pve-hwtools-smart
 EOUS
-  changed=1; echo "  [1b] 已建 pve-hwtools-smart.service"
+  echo "  [1b] 已建 pve-hwtools-smart.service"
 fi
 if [ ! -f /etc/systemd/system/pve-hwtools-smart.timer ]; then
   cat > /etc/systemd/system/pve-hwtools-smart.timer <<'EOUT'
@@ -515,7 +514,7 @@ WantedBy=timers.target
 EOUT
   systemctl daemon-reload >/dev/null 2>&1
   systemctl enable --now pve-hwtools-smart.timer >/dev/null 2>&1
-  changed=1; echo "  [1b] 已建并启用 pve-hwtools-smart.timer（每 5 分钟刷新）"
+  echo "  [1b] 已建并启用 pve-hwtools-smart.timer（每 5 分钟刷新）"
 fi
 
 # ---------- 2) 后端：概要取值（tdata）+ 工具集 API（hwtools）----------
@@ -546,8 +545,7 @@ s = re.sub(r"\n# PVE_HWAPI:BEGIN.*?# PVE_HWAPI:END\n", "", s, flags=re.S)
 a1 = "            free => $dinfo->{blocks} - $dinfo->{used},\n        };\n"
 if a1 not in s:
     sys.exit("ERROR: 后端 tdata 锚点失配——未找到预期代码")
-if "# PVE_HWPATCH" not in s:
-    s = s.replace(a1, a1 + "\n        # PVE_HWPATCH\n        $res->{tdata} = `/usr/bin/s.sh 2>/dev/null`;\n", 1)
+s = s.replace(a1, a1 + "\n        # PVE_HWPATCH\n        $res->{tdata} = `/usr/bin/s.sh 2>/dev/null`;\n", 1)
 
 # 2b) 工具集 API：挂在 Nodeinfo 包（use base 之后）
 # 注意：本文件里 `use base qw(PVE::RESTHandler);` 有**两处**（Nodeinfo 与 Nodes），
@@ -611,11 +609,9 @@ __PACKAGE__->register_method({
         for my $kv (split(/[ \t]+/, $param->{values} // '')) {
             $kv =~ s/^\\s+|\\s+$//g;
             next if $kv eq '';
-            # 值的字符类**必须允许下划线**：EPP 档位名形如 balance_performance。
-            # 只允许字母数字下划线点减号，杜绝 shell 元字符——防注入的同时不误伤合法取值。
             # 值的字符类必须允许：下划线（EPP 档位名 balance_performance）、
             # 冒号与逗号（风扇曲线 25:12,30:24,45:47,60:78,80:100）。
-            # 仍只允许字母数字下划线点减号冒号逗号，杜绝 shell 元字符——防注入且不误伤合法取值。
+            # 仍只允许字母数字下划线点减号冒号逗号百分号加号——杜绝 shell 元字符，防注入且不误伤合法取值。
             # 键名必须允许**数字**：风扇配置项形如 fan1_mode / fan3_curve。
             # 曾经只写 [a-z_]+，于是 fan1_mode 一律被判非法、保存永远失败。
             die "非法参数：$kv\\n" if $kv !~ /^[a-z][a-z0-9_]*=[0-9a-zA-Z_.:,%+-]*$/;
@@ -1031,7 +1027,6 @@ PY
   fi
   perl -c "$N" >/dev/null 2>&1 || { echo "  perl 语法校验失败，回滚"; cp -a "$BK/Nodes.pm.bak.hwpatch" "$N"; exit 1; }
   echo "  [2] perl 语法校验通过"
-  changed=1
   if grep -q "^backend_changed=1$" /var/run/pve-hwpatch.flags 2>/dev/null; then
     backend_changed=1
   fi
@@ -2038,7 +2033,6 @@ Ext.define('PVE.node.HwTools', {
             var d = res || {};
             var ch = (d.channels || []);
             var rows = [];
-            var order = me.stringifyOrder || [];
             ch.forEach(function (c) {
                 var nm = me.fanNameOf(c.n);
                 rows.push(gettext('通道 ') + c.n + '：' + (c.present
@@ -2656,7 +2650,7 @@ WantedBy=multi-user.target
 EOU
   systemctl daemon-reload >/dev/null 2>&1
   systemctl enable pve-hwtools-apply.service >/dev/null 2>&1
-  changed=1; echo "  [5] 已建并启用 pve-hwtools-apply.service"
+  echo "  [5] 已建并启用 pve-hwtools-apply.service"
 else
   echo "  [5] pve-hwtools-apply.service 已存在"
 fi

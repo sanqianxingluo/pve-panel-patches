@@ -130,27 +130,24 @@ cpufreq_ok() { [ -d "$CPUS/cpu0/cpufreq" ] || [ -d "$(policies | head -1)" ]; }
 # ---------- 硬件事实（一律现读，不缓存；单位 kHz） ----------
 hw_min_khz() {
   local m="" v
-  for p in $(policies); do v=$(cat "$p/cpuinfo_min_freq" 2>/dev/null); [ -n "$v" ] || continue
+  for p in $(policies); do IFS= read -r v < "$p/cpuinfo_min_freq" 2>/dev/null || v=""; [ -n "$v" ] || continue
     if [ -z "$m" ] || [ "$v" -lt "$m" ]; then m=$v; fi; done
   printf '%s' "${m:-0}"
 }
 hw_max_khz() {
   local m="" v
-  for p in $(policies); do v=$(cat "$p/cpuinfo_max_freq" 2>/dev/null); [ -n "$v" ] || continue
+  for p in $(policies); do IFS= read -r v < "$p/cpuinfo_max_freq" 2>/dev/null || v=""; [ -n "$v" ] || continue
     if [ -z "$m" ] || [ "$v" -gt "$m" ]; then m=$v; fi; done
   printf '%s' "${m:-0}"
 }
 live_gov()  { local g=""; for p in $(policies); do g=$(cat "$p/scaling_governor" 2>/dev/null); break; done; printf '%s' "${g:-unknown}"; }
-live_min()  { local m="" v; for p in $(policies); do v=$(cat "$p/scaling_min_freq" 2>/dev/null); [ -n "$v" ] || continue
+live_min()  { local m="" v; for p in $(policies); do IFS= read -r v < "$p/scaling_min_freq" 2>/dev/null || v=""; [ -n "$v" ] || continue
               if [ -z "$m" ] || [ "$v" -lt "$m" ]; then m=$v; fi; done; printf '%s' "${m:-0}"; }
-live_max()  { local m="" v; for p in $(policies); do v=$(cat "$p/scaling_max_freq" 2>/dev/null); [ -n "$v" ] || continue
+live_max()  { local m="" v; for p in $(policies); do IFS= read -r v < "$p/scaling_max_freq" 2>/dev/null || v=""; [ -n "$v" ] || continue
               if [ -z "$m" ] || [ "$v" -gt "$m" ]; then m=$v; fi; done; printf '%s' "${m:-0}"; }
 live_cur()  { local c=""; for p in $(policies); do c=$(cat "$p/scaling_cur_freq" 2>/dev/null); break; done; printf '%s' "${c:-0}"; }
 base_khz()  { local v; v=$(cat "$(policies | head -1)/base_frequency" 2>/dev/null); printf '%s' "${v:-0}"; }
 cpudriver() { local v; v=$(cat "$(policies | head -1)/scaling_driver" 2>/dev/null); printf '%s' "${v:-unknown}"; }
-
-# 离散频率表（老式 acpi-cpufreq 才有）
-avail_freqs() { local v; v=$(cat "$(policies | head -1)/scaling_available_frequencies" 2>/dev/null); printf '%s' "$v"; }
 
 # 可用调速器：用户列的五种中仅保留内核确实支持者，再补内核上报的其它（去掉 userspace）
 avail_govs() { local a=""; a=$(cat "$(policies | head -1)/scaling_available_governors" 2>/dev/null); printf '%s' "$a"; }
@@ -196,6 +193,7 @@ else
   cpu_vendor() { grep -m1 '^vendor_id' /proc/cpuinfo 2>/dev/null | awk '{print $3}'; }
   cpu_fam()    { grep -m1 '^cpu family' /proc/cpuinfo 2>/dev/null | awk '{print $4}'; }
   cpu_mod()    { grep -m1 '^model' /proc/cpuinfo 2>/dev/null | head -1 | sed 's/^model[[:space:]]*:[[:space:]]*//'; }
+  cpu_brand()  { grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | sed 's/^model name[[:space:]]*:[[:space:]]*//'; }
   cpu_gen()    { printf '%s family %s model %s' "$(cpu_vendor)" "$(cpu_fam)" "$(cpu_mod)"; }
 fi
 
@@ -457,7 +455,6 @@ fan_ensure_scan() {
 }
 
 fan_rpm()  { local d; d=$(nct_dir) || { printf '0'; return; }; cat "$d/fan${1}_input" 2>/dev/null || printf '0'; }
-fan_enable(){ local d; d=$(nct_dir) || return; cat "$d/pwm${1}_enable" 2>/dev/null; }
 
 # 可选温度源：只保留读数为 0 以外、且标签不像 AUXTIN 空脚的
 fan_temp_sources() {
@@ -514,7 +511,7 @@ fan_restore_baseline() {
 
 # 校验曲线：形如 25:12,30:24,45:47,60:78,80:100 —— 恰 5 点，温度严格升序，占空比 1~100%
 valid_curve() {
-  local v="$1" pts t w prev=-1 n=0 out=""
+  local v="$1" pts t w prev=-1 out=""
   IFS=',' read -ra pts <<< "$v"
   [ "${#pts[@]}" = 5 ] || die "曲线必须是 5 个点（温度:占空比%，逗号分隔），现为 ${#pts[@]} 个"
   for p in "${pts[@]}"; do
@@ -524,7 +521,7 @@ valid_curve() {
     [ "$t" -ge 0 ] && [ "$t" -le 120 ] || die "曲线温度应在 0~120℃：$p"
     [ "$w" -ge "$FAN_PWM_PCT_MIN" ] && [ "$w" -le 100 ] || die "曲线占空比应在 $FAN_PWM_PCT_MIN~100%：$p"
     [ "$t" -gt "$prev" ] || die "曲线温度必须严格递增（前一点 $prev，当前 $t）"
-    prev=$t; n=$((n+1))
+    prev=$t
     out="$out$t:$w,"
   done
   VALID="${out%,}"
@@ -624,33 +621,13 @@ cmd_fan_test() {
     "$n" "$before" "$peak" "$after" "$target" "$moved" "$([ "$before" -eq 0 ] || [ "$after" -gt 0 ] && echo true || echo false)"
 }
 
-# ── 自动识别：逐通道试转，判出哪些通道真接着风扇 ──
-#   判据：本来就转 => 有；原本 0 转、施加占空比后转起来 => 有；施加后仍 0 => 无。
-#   每个通道做完立即还原，绝不留改动。
 # ═══════════════════════════════════════════════════════════════
 # 自动识别：先探哪些插针真接了风扇，再用 CPU 负载关联找出哪一个是 CPU 风扇。
 #   芯片不提供风扇名（fan*_label 全空），所以只能靠「试转 + 负载响应」推断。
-#   未接风扇的通道标记 present=false，由调用方决定是否隐藏显示。
-#   全程保基线、无条件还原——认风扇不能把用户风扇留在手动全速。
-# ═══════════════════════════════════════════════════════════════
-# ═══════════════════════════════════════════════════════════════
-# 自动识别：先探哪些插针真接了风扇，再用 CPU 负载关联找出哪一个是 CPU 风扇。
-#   芯片不提供风扇名（fan*_label 全空），只能靠「试转 + 负载响应」推断。
 #   内部一律走 TSV（n rpm peak present bp），最后才拼 JSON——
 #   对 JSON 直接做 sed 太脆：模式失配时会把整条记录当数字做算术，当场报错。
 #   全程保基线、无条件还原：认风扇不能把用户风扇留在手动全速。
 # ═══════════════════════════════════════════════════════════════
-fan_rpm_peak() {
-  # 采样若干次取峰值：转速表有噪声，单次读数容易被误判
-  local n="$1" k="${2:-5}" i v p=0
-  for i in $(seq 1 "$k"); do
-    v=$(fan_rpm "$n")
-    [ "$v" -gt "$p" ] && p=$v
-    sleep 1
-  done
-  printf '%s' "$p"
-}
-
 # 一次完整扫描，回传 TSV：n / 静止转速 / 静止峰值 / 是否接了风扇 / 满载峰值
 fan_detect_full() {
   need_root
@@ -773,8 +750,6 @@ fan_temp_sel() {
   [ -r "$d/pwm${n}_temp_sel" ] && cat "$d/pwm${n}_temp_sel" 2>/dev/null
 }
 
-# 实测：把通道 n 减速后，PECI 升温多少度（整数，单位 0.001°C → 这里换算成 mC 差）
-
 # 自动绑定：只做能被证实的判断，不猜测硬件没有的信息。
 #   能证实的三件事：
 #     ① 哪个插针真接了风扇（静止的插针试转一下，转起来就是有）；
@@ -851,7 +826,7 @@ valid_fan_channel() {
   local v="$1" n
   case "$v" in ''|*[!0-9]*) die "风扇通道号不合法：$v" ;; esac
   for n in $(fan_channels); do [ "$n" = "$v" ] && { VALID="$v"; return 0; }; done
-  die "本机没有风扇通道 $v。可用：$(fan_channels | tr ' ' ' ')"
+  die "本机没有风扇通道 $v。可用：$(fan_channels)"
 }
 valid_fan_sel() {
   local v="$1" line ok=0
@@ -879,7 +854,7 @@ fan_apply_one() {   # $1=通道号
   local var="FAN${n}"
   local mode; eval "mode=\${${var}_MODE:-off}"
   local sel;  eval "sel=\${${var}_SEL:-2}"
-  local man;  eval "man=\${${var}_MANUAL:-128}"
+  local man;  eval "man=\${${var}_MANUAL:-50}"
   local curve; eval "curve=\${${var}_CURVE:-}"
 
   local before; before=$(fan_rpm "$n")
@@ -954,7 +929,7 @@ fan_status_json() {
 }
 
 # JSON 字符串转义（标签里可能有引号或反斜杠）
-json_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+json_esc() { local _s=${1//\\/\\\\}; printf '%s' "${_s//\"/\\\"}"; }
 
 # ── 温度源的人话翻译 ──
 # 芯片给的名字（PECI Agent 0 / AUXTIN0 / PCH_CHIP_TEMP）用户看不懂，也不知道该选哪个。
@@ -1195,7 +1170,6 @@ EOF
 
 # ---------- 命令 ----------
 cmd_status() { emit_status; }
-  fan_ensure_scan
 
 cmd_set() {
   need_root

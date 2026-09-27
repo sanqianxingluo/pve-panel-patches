@@ -64,7 +64,6 @@ EOF
 }
 
 all_names()  { printf '%s\n' "$MIRRORS" | cut -d'|' -f1 | tr '\n' ' '; }
-all_choices() { printf '%s\n' "$MIRRORS" | cut -d'|' -f1,2; }
 
 # ---------------------------------------------------------------- 仓库识别
 # 只认「我们知道的公共镜像」。自定义的私有源（内网 Nexus、自建仓库等）
@@ -92,6 +91,9 @@ https://download.proxmox.com/debian/pve|pve
 http://enterprise.proxmox.com/debian/pve|pve
 https://enterprise.proxmox.com/debian/pve|pve'
 
+# 按基址长度降序排好（长的先比），url_kind 直接吃这份，避免每次调用现排一遍
+KNOWN_BASES_SORTED=$(printf '%s\n' "$KNOWN_BASES" | awk -F'|' '{print length($1)"|"$0}' | sort -rn -t'|' -k1 | cut -d'|' -f2-)
+
 base_for() {   # $1=镜像 $2=种类
   case "$2" in
     pve)      mirror_field "$1" 5 ;;
@@ -103,13 +105,14 @@ base_for() {   # $1=镜像 $2=种类
 # 给出 URL 属于哪一类公共仓库；不认识的返回空
 url_kind() {
   local url="$1" line base kind
-  # 长的先比，免得 /debian 抢在 /debian-security 前面
+  # 长的先比，免得 /debian 抢在 /debian-security 前面。
+  # 排好序的表在脚本载入时算一次即可——url_kind 多以 $(...) 子壳调用，函数内缓存留不住。
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     base="${line%|*}"; kind="${line##*|}"
     case "$url" in "$base"*) printf '%s' "$kind"; return 0 ;; esac
   done <<EOF
-$(printf '%s\n' "$KNOWN_BASES" | awk -F'|' '{print length($1)"|"$0}' | sort -rn -t'|' -k1 | cut -d'|' -f2-)
+$KNOWN_BASES_SORTED
 EOF
   return 1
 }
@@ -345,12 +348,11 @@ cmd_list() {
 }
 
 cmd_status() {
-  local cur preset; cur=$(detect_current)
-  preset=""
-  [ -f "$STATE" ] && preset=$(. "$STATE" 2>/dev/null; printf '%s' "${preset:-}")
+  local cur preset="" applied_at=""
+  cur=$(detect_current)
+  [ -f "$STATE" ] && . "$STATE" 2>/dev/null
   printf '{"apt_mirror":"%s","apt_mirror_detected":"%s","apt_mirror_applied_at":"%s","apt_codename":"%s"}\n' \
-    "${preset:-$cur}" "$cur" \
-    "$([ -f "$STATE" ] && . "$STATE" 2>/dev/null; printf '%s' "${applied_at:-}")" \
+    "${preset:-$cur}" "$cur" "${applied_at:-}" \
     "$(codename)"
 }
 

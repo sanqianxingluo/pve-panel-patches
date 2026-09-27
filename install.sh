@@ -146,15 +146,13 @@ s = re.sub(r"\n[ \t]*// PVE_HWUI:MENU:BEGIN.*?// PVE_HWUI:MENU:END", "", s, flag
 s = re.sub(r"\n[ \t]*// PVE_HWPATCH\n.*?\n    \],", "\n    ],", s, flags=re.S)
 # 设置页大块（追加在文件末尾）
 s = re.sub(r"\n// PVE_HWUI:BEGIN.*?// PVE_HWUI:END", "", s, flags=re.S)
-# 面板高度复位成原厂值（这一处改动在标记块之外）
-s = re.sub(r"(alias: 'widget\.pveNodeStatus',\n\n    height: )\d+(,)", r"\g<1>350\g<2>", s, count=1)
 # 设置页块原本是追加在文件末尾的，剥掉后会多出空行——收尾规范化，与原厂一致
 s = s.rstrip() + "\n"
 open(J, 'w', encoding='utf-8', errors='surrogateescape').write(s)
 # 后端同样收尾规范化
 s = open(N, encoding='utf-8', errors='surrogateescape').read().rstrip() + "\n"
 open(N, 'w', encoding='utf-8', errors='surrogateescape').write(s)
-print("    已剥离注入块并复位面板高度")
+print("    已剥离注入块")
 PY
     perl -c "$N" >/dev/null 2>&1 && say "    perl 语法校验通过" || say "    ⚠ perl 语法有问题，建议重装 pve-manager"
   fi
@@ -195,6 +193,7 @@ if [ -n "$SELFDIR" ] && [ -f "$SELFDIR/pve-hwpatch.sh" ]; then
   say "使用本地文件：$SRC"
 else
   SRC=$(mktemp -d)
+  trap 'rm -rf "$SRC"' EXIT
   RAW="https://raw.githubusercontent.com/$REPO/$REF"
   say "本地无脚本，从 $RAW 下载"
   for f in $FILES; do
@@ -208,8 +207,10 @@ else
     say "    （$DOCFILE 未取到，面板「使用说明」按钮将不可用）"
   fi
   # 有 SHA256SUMS 就核对，防截断/篡改
+  # --ignore-missing：清单里含 install.sh 自身，而这条路径下不到它（它正在运行）。
+  # 不加这个开关会报 "install.sh: FAILED open or read" → 管道安装 100% 中止。
   if curl -fsSL "$RAW/SHA256SUMS" -o "$SRC/SHA256SUMS" 2>/dev/null; then
-    if (cd "$SRC" && sha256sum -c --quiet SHA256SUMS 2>/dev/null); then
+    if (cd "$SRC" && sha256sum -c --ignore-missing --quiet SHA256SUMS 2>/dev/null); then
       say "    校验和 OK"
     else
       die "校验和不符——下载可能被截断或篡改，已中止"
@@ -221,7 +222,7 @@ fi
 for f in $FILES; do
   bash -n "$SRC/$f" || die "$f 语法有误，中止"
 done
-say "三个脚本语法检查通过"
+say "$(printf '%s' "$FILES" | wc -w) 个脚本语法检查通过"
 
 # 2) 依赖
 step "[2/7] 依赖"
