@@ -1,6 +1,6 @@
 # Proxmox VE 面板补丁集
 
-> **当前版本：V3.4** · 发布于 2026-09-26
+> **当前版本：V3.5** · 发布于 2026-09-27
 > 适用：**Proxmox VE 9.x**（在 `pve-manager` 9.2.20 上实测通过）· 需 root
 
 给 PVE 原生 Web 界面补上它不显示的东西：**节点概要的硬件信息**、
@@ -810,6 +810,35 @@ apt 钩子没挂上。检查 `apt-config dump | grep -i post-invoke`，
 ---
 
 ## 更新日志
+
+**V3.5**（2026-09-27）— 全盘精简 + 修 4 个已复现缺陷（净 −86 行，行为不变）
+- **修 `install.sh` 校验和恒失败**：`SHA256SUMS` 里含 `install.sh` 自己，而 `curl | bash`
+  这条路径下不到它（正在运行的就是它）→ `sha256sum -c` 报 `FAILED open or read`
+  → 照 README 首推的管道安装**必然中止**，只有 git clone 那条路能装。加
+  `--ignore-missing` 修复；实测篡改文件仍会被正确拒绝。
+- **修 `pve-hwtools-agent` 里一行游离语句**：`fan_ensure_scan` 被粘到了 `cmd_status`
+  函数**外面**（V2.9 的笔误，2 空格缩进即其遗迹）。它在脚本载入时无条件执行，
+  于是 `need_root` 拦住了**所有**子命令 —— 非 root 调 `status` 由 exit 0 变 exit 1。
+  删掉后非 root 恢复正常，`fan-bind-progress` 轮询少 10 次 fork。
+- **修配置模板缺 `#`**：那行镜像说明在模板里不是注释，全新安装后每次读配置都冒
+  `ustc: command not found`。（同文件迁移分支那处本来就有 `#`，是 V2.4 漏的。）
+- **修卸载脚本改错面板高度**：它把 `pveNodeStatus` 的高度复位成 350，而原厂是 480；
+  且本补丁**从不**改面板高度（高度由 `PVE.HW.fit()` 按内容自适应）。已删掉这条
+  多余的复位 —— 否则「装了再卸」会把面板高度永久改错。
+- **删死代码**：`changed` 变量（9 处赋值、0 处读取）、`stringifyOrder`、
+  `avail_freqs` / `fan_enable` / `fan_rpm_peak` / `all_choices`、`hwfantest`（POST）
+  这个注册了但前端从不调用的接口（面板用的是 `hwfantest-get`）。
+- **去 fork / 去重复计算**（输出已逐字节比对一致）：
+  `status` 的 execve 从 **250 → 182**（约 −27%），10 次连测 **4.54 s → 3.43 s**；
+  `fan-bind-progress` **12 → 2**；`json_esc` 不再每次 fork 一个 `sed`；
+  逐 policy 的 `cat` 改成 `IFS read` 内建；`url_kind` 每次调用现排 21 行表
+  改成载入时排一次；`cmd_status` 重复读 state 文件改成读一次。
+- **结构收敛**：4 个结构相同的升级接口（`hwupgradepve` / `hwupgradekernel` /
+  `hwkernelrollback` / `hwkernelrelease`）改由一份模板 + 数据表生成，
+  生成的 Perl **逐字节不变**（改完在真机上 `cmp` 验证）；`fan_prog`/`upg_prog`
+  合出 `prog_write`；`kernel_hold`/`kernel_unhold` 合出 `kernel_mark`。
+- 另修：`man` 的兜底值 128（旧 raw PWM 口径）→ 50（百分比口径，与同一提交的
+  读取路径一致）；安装脚本那句「三个脚本语法检查通过」改成按实际文件数输出。
 
 **V3.4**（2026-09-26）
 - **修掉概要页约 1 秒的延迟**：点进概要要等约 2 秒，其中约 1.5 秒全花在硬件采集接口 `/nodes/{node}/hwtools` 上（其余 API 只有 6–150 ms）。
