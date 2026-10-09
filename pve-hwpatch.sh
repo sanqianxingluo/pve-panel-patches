@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-hwpatch.sh —— PVE 面板工具集（硬件概要 + CPU 调频 + 订阅提示屏蔽）
-# 版本：V3.4
+# 版本：V3.8
 #
 # 注入三样，全部幂等、可自愈：
 #   1) 节点概要的「硬件概要」区块（温度 / 风扇 / 硬盘 / 频率）——四项可分别开关
@@ -414,11 +414,14 @@ fi
 # 而 smartctl 读 /dev/* 需要 root（非 root 直接 Permission denied）。于是健康度/
 # 寿命/读写量在面板里永远是空的。办法：root 定时采一次 → 写世界可读的缓存，
 # s.sh（可能非 root）只读缓存。
-if [ ! -f "$SMARTBIN" ] || ! grep -q "PVE_HWPATCH-SMART-v1" "$SMARTBIN" 2>/dev/null; then
+if [ ! -f "$SMARTBIN" ] || ! grep -q "PVE_HWPATCH-SMART-v3" "$SMARTBIN" 2>/dev/null; then
   cat > "$SMARTBIN" <<'EOSM'
 #!/bin/bash
-# PVE_HWPATCH-SMART-v1 —— root 采集各磁盘 SMART 到世界可读缓存。
+# PVE_HWPATCH-SMART-v3 —— root 采集各磁盘 SMART 到世界可读缓存。
 #   输出 <dev>|健康|剩余寿命%|累计读|累计写|温度(毫度)，每行一块盘；读不到留空。
+#   ★v2：盘被 VM(QEMU) 占用时宿主 SCSI 透传会 DID_NO_CONNECT，SMART 属性表退化成
+#        只剩通电时间/温度；此时累计读写改用内核计数 /sys/block/<盘>/stat 兜底，
+#        值后缀 (boot) 以区别 SMART 的终身值。
 #   健康 0=正常 1=警告 2=异常
 OUT=/run/pve-hwtools-smart.txt
 TMP="${OUT}.$$"
@@ -462,6 +465,24 @@ if command -v smartctl >/dev/null 2>&1; then
     if [ -z "$wr" ]; then
       lba=$(printf '%s\n' "$sr" | awk -F'[ ]+' 'index($0,"Total_LBAs_Written")>0 {print $10; exit}')
       case "$lba" in ''|*[!0-9]*) : ;; *) wr=$(awk -v b="$lba" 'BEGIN{n=b*512; if(n>=1099511627776) printf "%.1f TB", n/1099511627776; else printf "%.1f GB", n/1073741824}');; esac
+    fi
+
+    # ★兜底：SMART 拿不到累计读写时（典型场景：盘已逐盘直通给 VM，QEMU 占用着设备，
+    #   宿主发 SCSI 透传会 Synchronize Cache failed: DID_NO_CONNECT，属性表退化只剩
+    #   通电时间/温度）。改用内核计数 /sys/block/<盘>/stat：第 3 列=读扇区、第 7 列=写扇区，
+    #   不需要 root/SG 透传，必定拿得到。语义是「自本次开机」，故加后缀区分。
+    if [ -z "$rd" ] || [ -z "$wr" ]; then
+      st=$(cat "/sys/block/$n/stat" 2>/dev/null)
+      if [ -n "$st" ]; then
+        sec_r=$(printf '%s\n' "$st" | awk '{print $3}')
+        sec_w=$(printf '%s\n' "$st" | awk '{print $7}')
+        if [ -z "$rd" ]; then
+          rd=$(awk -v x="$sec_r" 'BEGIN{n=x*512; if(n>=1099511627776) printf "%.1f TB(boot)", n/1099511627776; else printf "%.1f GB(boot)", n/1073741824}')
+        fi
+        if [ -z "$wr" ]; then
+          wr=$(awk -v x="$sec_w" 'BEGIN{n=x*512; if(n>=1099511627776) printf "%.1f TB(boot)", n/1099511627776; else printf "%.1f GB(boot)", n/1073741824}')
+        fi
+      fi
     fi
 
     tm=""
